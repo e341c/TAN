@@ -1,0 +1,34 @@
+{
+  "model_name": "price_regressor_lgbm",
+  "version": "2025-11-17T22-19-21",
+  "features": [
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_lag_1",
+    "volume_lag_2",
+    "volume_lag_3",
+    "volume_lag_5",
+    "close_lag_6",
+    "close_lag_8",
+    "close_lag_10",
+    "volume_lag_10",
+    "close_lag_12",
+    "close_lag_17",
+    "close_lag_18",
+    "volume_lag_18",
+    "close_lag_20",
+    "close_lag_21",
+    "close_lag_22",
+    "close_lag_23",
+    "volume_lag_23",
+    "volume_lag_24"
+  ],
+  "metrics": {
+    "MAE": 1.9074346622135763,
+    "R2": 0.3048400061956409,
+    "IC": 0.631394481124191
+  },
+  "horizon": 24
+}

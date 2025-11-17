@@ -34,6 +34,7 @@ for name, horizon in horizons.items():
     cfg["horizon"] = horizon
     cfg["window"] = windows[name]
     cfg["output_dir"] = os.path.join(base_output_dir, name)
+    cfg["model_name"] = name
     os.makedirs(cfg["output_dir"], exist_ok=True)
 
     with open(cfg_path, "w") as f:

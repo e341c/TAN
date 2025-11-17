@@ -1,6 +1,6 @@
 symbol: BTCUSDT
 data_path: ./data/btcusdt_1h.csv
-horizon: 12
+horizon: 24
 cv_splits: 5
 n_estimators: 800
 learning_rate: 0.03

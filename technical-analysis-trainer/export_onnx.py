@@ -3,7 +3,7 @@ import json, os
 from onnxmltools import convert_lightgbm # type: ignore
 from skl2onnx.common.data_types import FloatTensorType # type: ignore
 
-def export_model(model, features, eval_results, output_dir, version): # type: ignore
+def export_model(model, features, eval_results, output_dir, version, horizon): # type: ignore
     # модель — lgb.LGBMRegressor, у неё есть booster_
     booster = model.booster_ # type: ignore
 
@@ -26,6 +26,7 @@ def export_model(model, features, eval_results, output_dir, version): # type: ig
         "version": version,
         "features": features,
         "metrics": eval_results,
+        "horizon": horizon,
     }
     with open(os.path.join(model_path, "meta.json"), "w") as f: # type: ignore
         json.dump(meta, f, indent=2)
