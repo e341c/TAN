@@ -1,0 +1,19 @@
+# Основные библиотеки для регрессионного ИИ
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.5.2
+lightgbm==4.5.0
+ta==0.11.0
+pyyaml==6.0.2
+
+# Экспорт в ONNX
+onnxmltools==1.13.0
+skl2onnx==1.17.0
+onnxruntime==1.19.2
+
+# REST API (опционально)
+Flask==3.0.3
+
+# Линтеры и отладка
+ipython
+black

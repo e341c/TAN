@@ -1,0 +1,24 @@
+{
+  "model_name": "price_regressor_lgbm",
+  "version": "2025-11-04T22-15-09",
+  "features": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "rsi14",
+    "macd",
+    "signal",
+    "atr14",
+    "z_close100",
+    "vol_roll50",
+    "body_ratio",
+    "volume_z"
+  ],
+  "metrics": {
+    "MAE": 0.005109749132771296,
+    "R2": 0.002580591855142922,
+    "IC": 0.14190057382676027
+  }
+}
