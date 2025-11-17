@@ -1,5 +1,5 @@
 # TAN
-
+```
 quant-regressor/
 ├── deploy/
 │   ├── docker-compose.yml
@@ -34,3 +34,4 @@ quant-regressor/
 └── shared/
     ├── schemas/                  # Avro/JSON схемы сообщений/метаданных
     └── docs/                     # ТЗ, ADR, SLA
+```
