@@ -1,9 +1,15 @@
+# General settings
 symbol: BTCUSDT
 data_path: ./data/btcusdt_1h.csv
+
+# Model parameters
+epochs: 100
+learning_rate: 0.001
+hidden_size: 64
+
 horizon: 24
 cv_splits: 5
 n_estimators: 800
-learning_rate: 0.03
 max_depth: 8
 output_dir: ./models
 window:
