@@ -1,3 +1,4 @@
+# FIX scaler save to a model and export into onnx
 import torch
 
 def export_model(model, features, eval_results, output_dir, version, horizon):

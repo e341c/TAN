@@ -10,12 +10,12 @@ MAX_LAG = {
     "long": 24,
 }
 
-def add_features(df: pd.DataFrame, seq_len: int = 30, model_name: str = "none") -> tuple[np.ndarray, np.ndarray, list[str]]:
+def add_features(df: pd.DataFrame, seq_len: int = 30, model_name: str = "none", scaler=None) -> tuple[np.ndarray, np.ndarray, list[str], MinMaxScaler]:
     """
     Простые фичи:
       - open, high, low, close, volume
       - returns (log-доходность 1 бара)
-      - close_lag_1..N, volume_lag_1..N (N <= 24)
+      - close_lag_1..N, volume_lag_1..N (N <= 24)AndServelish
     Без RSI/MACD/ATR — убираем потенциальный шум.
     """
     df = df.copy()
@@ -24,8 +24,16 @@ def add_features(df: pd.DataFrame, seq_len: int = 30, model_name: str = "none") 
 
     data = df[features]
 
-    scaler = MinMaxScaler()
-    data_scaled = scaler.fit_transform(data)
+    # scaler = MinMaxScaler()
+    # data_scaled = scaler.fit_transform(data)
+
+    if scaler is None:
+        from sklearn.preprocessing import MinMaxScaler
+        scaler = MinMaxScaler()
+        data_scaled = scaler.fit_transform(data)
+    else:
+        data_scaled = scaler.transform(data)
+
 
     X = []
     y = []
@@ -33,4 +41,4 @@ def add_features(df: pd.DataFrame, seq_len: int = 30, model_name: str = "none") 
         seq = data_scaled[i:i + seq_len]
         X.append(seq)
         y.append(data_scaled[i + seq_len][3]) # target: close price of the next time step
-    return np.array(X), np.array(y).reshape(-1, 1), features
+    return np.array(X), np.array(y).reshape(-1, 1), features, scaler

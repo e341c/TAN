@@ -1,3 +1,4 @@
+# FIX scaler save to a model and export into onnx
 # train.py
 import numpy as np
 from dataset import load_dataset
@@ -26,9 +27,9 @@ def main():
     df = load_dataset(cfg["data_path"])
 
     # Features and Target
-    X, y, used_features = add_features(df, seq_len=window["long"])
+    X, y, used_features, scaler = add_features(df, seq_len=window["long"], model_name=symbol, scaler=None)
 
-    model, train_metrics = train_model(X=X, y=y, cfg=cfg)
+    model, train_metrics = train_model(X=X, y=y, cfg=cfg, feature_min=scaler.data_min_, feature_max=scaler.data_max_)
 
     # Evaluation
     from eval import evaluate_model
