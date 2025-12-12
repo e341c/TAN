@@ -6,7 +6,7 @@ from export_onnx import export_model
 from eval import evaluate_model
 import yaml, datetime, os
 from model import train_model
-
+from features import add_features
 
 def main():
     # Config
@@ -25,30 +25,17 @@ def main():
     # Dataset
     df = load_dataset(cfg["data_path"])
 
-    # # Indicators
-    # df = add_features(df, window=window, model_name=cfg.get("model_name"))
-    # print(f"✅ Added {window}-step historical context (lag_window <= 24)")
+    # Features and Target
+    X, y, used_features = add_features(df, seq_len=window["long"])
 
-    # # Target
-    # raw_target = np.log(df["close"].shift(-horizon) / df["close"])
-    # df["target"] = TARGET_SCALE * raw_target
-    # df = df.dropna().reset_index(drop=True)
-
-    # # Model training
-    # all_features = [c for c in df.columns if c not in ["ts", "target"]]
-    # X = df[all_features]
-    # y = df["target"]
-
-    model = train_model(X=df[[ "close"]], y=df["close"].shift(-horizon), cfg=cfg)
+    model, train_metrics = train_model(X=X, y=y, cfg=cfg)
 
     # Evaluation
     from eval import evaluate_model
-    eval_results = evaluate_model(model, df[used_features], y)
+    eval_results = evaluate_model(model, X, y)
 
     # Export
     timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
-    # export_model(model, used_features, eval_results, model_dir, version=timestamp)
-    # export_model(model, features=used_features, eval_results, model_dir, version=timestamp, horizon=horizon)
     export_model(
         model=model,
         features=used_features,

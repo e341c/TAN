@@ -1,6 +1,6 @@
 # General settings
 symbol: BTCUSDT
-data_path: ./data/btcusdt_1h.csv
+data_path: ./data/btcusdt_1h_train.csv
 
 # Model parameters
 epochs: 100
