@@ -3,7 +3,8 @@ symbol: BTCUSDT
 data_path: ./data/btcusdt_1h_train.csv
 
 # Model parameters
-epochs: 100
+# epochs: 50
+epochs: 300
 learning_rate: 0.001
 hidden_size: 64
 
@@ -15,4 +16,4 @@ output_dir: ./models
 window:
   short: 1
   mid: 12
-  long: 24
+  long: 30
