@@ -1,34 +1,19 @@
-# py-trainer/export_onnx.py
-import json, os
-from onnxmltools import convert_lightgbm # type: ignore
-from skl2onnx.common.data_types import FloatTensorType # type: ignore
+# FIX scaler save to a model and export into onnx
+import torch
 
-def export_model(model, features, eval_results, output_dir, version, horizon): # type: ignore
-    # модель — lgb.LGBMRegressor, у неё есть booster_
-    booster = model.booster_ # type: ignore
+def export_model(model, features, eval_results, output_dir, version, horizon):
+    model.eval()
+    onnx_path = f"{output_dir}/model_{version}.onnx"
 
-    # конвертация LightGBM → ONNX
-    onnx_model = convert_lightgbm( # type: ignore
-        booster, # type: ignore
-        initial_types=[("float_input", FloatTensorType([None, len(features)]))], # type: ignore
-        target_opset=15
+    dummy_input = torch.randn(1, 30, len(features))  # 30 — фиксированное окно
+    print("dummy_input", dummy_input.shape)
+    torch.onnx.export(
+        model,
+        dummy_input, # type: ignore
+        onnx_path,
+        input_names=["X"],
+        output_names=["y"],
+        opset_version=18,  # рекомендуемый для PyTorch 2.x
+        dynamo=False,
     )
-
-    model_path = os.path.join(output_dir, version) # type: ignore
-    os.makedirs(model_path, exist_ok=True) # type: ignore
-    onnx_file = os.path.join(model_path, "model.onnx") # type: ignore
-
-    with open(onnx_file, "wb") as f:
-        f.write(onnx_model.SerializeToString()) # type: ignore
-
-    meta = { # type: ignore
-        "model_name": "price_regressor_lgbm",
-        "version": version,
-        "features": features,
-        "metrics": eval_results,
-        "horizon": horizon,
-    }
-    with open(os.path.join(model_path, "meta.json"), "w") as f: # type: ignore
-        json.dump(meta, f, indent=2)
-
-    print(f"✅ ONNX model exported to {onnx_file}")
+    print(f"✅ Model exported to {onnx_path}")

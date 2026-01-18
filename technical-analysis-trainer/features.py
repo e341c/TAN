@@ -1,91 +1,74 @@
 # features.py
-
 import pandas as pd
 import numpy as np
+from sklearn.preprocessing import StandardScaler
 
-# MAX_LAG = 24  # <= 24 как ты и хотел
-MAX_LAG = {
-    "short": 6,
-    "mid": 12,
-    "long": 24,
-}
 
-def add_features(df: pd.DataFrame, window: int = 24, model_name: str = "none") -> pd.DataFrame:
+def add_features(
+    df: pd.DataFrame,
+    seq_len: int = 30,
+    scaler: StandardScaler | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str], StandardScaler]:
     """
-    Простые фичи:
-      - open, high, low, close, volume
-      - returns (log-доходность 1 бара)
-      - close_lag_1..N, volume_lag_1..N (N <= 24)
-    Без RSI/MACD/ATR — убираем потенциальный шум.
+    Feature engineering for time series data.:
+        - open, high, low, close, volume
+        - returns (log-доходность 1 бара)
+        - close_lag_1..N, volume_lag_1..N (N <= 24)AndServelish
     """
+    # dataset has ts,open,high,low,close,volume
     df = df.copy()
+    df["rsi14"] = compute_rsi(df["close"], period=14)
 
-    # Базовые
-    df["open"] = df["open"]
-    df["high"] = df["high"]
-    df["low"] = df["low"]
-    df["close"] = df["close"]
-    # df["volume"] = df["volume"]
-    df["volume"] = np.log(df["volume"] + 1)
+    df["log_return"] = np.log(df["close"] / df["close"].shift(1))
+    df = df.dropna().reset_index(drop=True)  # dont know what this code do
 
-    # Лог-доходность последнего бара
-    # df["returns"] = np.log(df["close"] / df["close"].shift(1))
-    df["returns"] = np.log(df["close"].pct_change() + 1)
+    df["volume_log"] = np.log(df["volume"] + 1)
+    df["rsi_scaled"] = df["rsi14"] / 100
 
-    # Лаги (ограничены 24)
-    lag_window = min(window, MAX_LAG[model_name])
-    for i in range(1, lag_window + 1):
-        df[f"close_lag_{i}"] = df["close"].shift(i)
-        df[f"volume_lag_{i}"] = df["volume"].shift(i)
+    features = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "log_return",
+        "volume_log",
+        "rsi_scaled",
+    ]
 
-    df = df.dropna().reset_index(drop=True)
-    return df
+    data = df[features].values
+    target = df["log_return"].values  # future return
 
-# # features.py
-# import pandas as pd
-# import numpy as np
+    if scaler is None:
+        scaler = StandardScaler()
+        scaler.fit(data[:-seq_len])  # no future leakage
 
-# def add_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
-#     """
-#     Добавляет стандартные технические индикаторы + лаги за последние N свечей.
-#     """
-#     df = df.copy()
-    
-#     # --- Базовые индикаторы ---
-#     df["returns"] = np.log(df["close"] / df["close"].shift(1))
-#     df["rsi14"] = compute_rsi(df["close"], 14)
-#     df["macd"], df["signal"] = compute_macd(df["close"])
-#     df["atr14"] = compute_atr(df, 14)
+    data_scaled = scaler.transform(data)
 
-#     # --- Лаги (контекст последних N свечей) ---
-#     for i in range(1, window + 1):
-#         df[f"close_lag_{i}"] = df["close"].shift(i)
-#         df[f"volume_lag_{i}"] = df["volume"].shift(i)
+    X = []
+    y = []
 
-#     # --- Очистка ---
-#     df = df.dropna().reset_index(drop=True)
-#     return df
+    for i in range(len(data_scaled) - seq_len):
+        X.append(data_scaled[i : i + seq_len])
+        y.append(target[i + seq_len])
+
+    return (
+        np.array(X, dtype=np.float32),
+        np.array(y, dtype=np.float32),
+        features,
+        scaler,
+    )
 
 
-# def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-#     delta = series.diff()
-#     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-#     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-#     rs = gain / loss
-#     return 100 - (100 / (1 + rs))
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
 
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-# def compute_macd(series: pd.Series, fast=12, slow=26, signal=9):
-#     ema_fast = series.ewm(span=fast, adjust=False).mean()
-#     ema_slow = series.ewm(span=slow, adjust=False).mean()
-#     macd = ema_fast - ema_slow
-#     signal_line = macd.ewm(span=signal, adjust=False).mean()
-#     return macd, signal_line
+    avg_gain = gain.rolling(window=period, min_periods=period).mean().fillna(0)
+    avg_loss = loss.rolling(window=period, min_periods=period).mean().fillna(0)
 
+    rs = avg_gain / (avg_loss + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
 
-# def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-#     high_low = df["high"] - df["low"]
-#     high_close = np.abs(df["high"] - df["close"].shift())
-#     low_close = np.abs(df["low"] - df["close"].shift())
-#     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-#     return tr.rolling(period).mean()
+    return rsi
