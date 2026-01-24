@@ -150,9 +150,9 @@ def trendPredict(X_window: np.ndarray, df: pd.DataFrame):
     print(pred_class)
 
     result = {
-        "DOWN": float(probs[0]),
-        "FLAT": float(probs[1]),
-        "UP": float(probs[2]),
+        "DOWN": f"{probs[0] * 100:.2f}%",
+        "FLAT": f"{probs[1] * 100:.2f}%",
+        "UP": f"{probs[2] * 100:.2f}%",
         "predicted_trend": classes[np.argmax(probs)],
     }
     print(result)
