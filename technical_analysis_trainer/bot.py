@@ -43,7 +43,12 @@ async def send_message():
 • {data['log_returns'][1]:+.5f}
 • {data['log_returns'][2]:+.5f}
 
-{trendData}
+Trend:
+Down: {trendData["DOWN"]}
+Flat: {trendData["FLAT"]}
+Up: {trendData["UP"]}
+
+Predicted trend - {trendData["predicted_trend"]}
 """
 
     print(message)
