@@ -16,7 +16,7 @@ trendTimestamp = "2026-01-23T13-14-54"
 SCALER_PATH = f"technical_analysis_trainer/models/{timestamp}/scaler_{timestamp}.pkl"
 ONNX_MODEL_PATH = f"technical_analysis_trainer/models/{timestamp}/model_{timestamp}.onnx"
 
-SCALER_TREND_PATH = f"technical_analysis_trainer/trend_model/models/{timestamp}/scaler-{timestamp}.pkl"
+SCALER_TREND_PATH = f"technical_analysis_trainer/trend_model/models/{trendTimestamp}/scaler-{trendTimestamp}.pkl"
 ONNX_TREND_MODEL_PATH = f"technical_analysis_trainer/trend_model/models/{trendTimestamp}/model_{trendTimestamp}.onnx"
 
 SEQ_LEN = 30
@@ -69,7 +69,7 @@ async def fetch_last_candles(symbol: str, interval: str, limit: int = 30):
     return df
 
 
-def scaleData(df: pd.DataFrame):
+def scaleData(df: pd.DataFrame, scaler_path):
     print("Starting get data")
 
     df = df.iloc[:-1].reset_index(drop=True)
@@ -83,7 +83,7 @@ def scaleData(df: pd.DataFrame):
     # =============================
     # 2. Load scaler
     # =============================
-    with open(SCALER_PATH, "rb") as f:
+    with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
     print("✅ Scaler loaded")
 
@@ -169,12 +169,13 @@ async def getPreds():
         print("No data fetched")
         return "No data fetched"
 
-    X_window, df = scaleData(data)
+    X_window, df = scaleData(data, SCALER_PATH)
+    X_window_trend, df_trend = scaleData(data, SCALER_TREND_PATH)
 
     print(df)
 
     preds = quantilePredict(X_window, df)
 
-    trendRes = trendPredict(X_window, df)
+    trendRes = trendPredict(X_window_trend, df_trend)
 
     return preds, trendRes
