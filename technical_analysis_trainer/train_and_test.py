@@ -1,17 +1,15 @@
-# main.py
 import numpy as np
 from dataset import load_dataset
 from export_onnx import export_model
 import yaml, datetime, os
-from model import train_model, train_quantile_lstm
-from features import add_features
+from quantile_model.quantile_model import train_quantile_lstm
+from quantile_model.features import add_features
 import pickle
 from eval import evaluate_model
 import pandas as pd
-import numpy as np
 import onnxruntime as ort
-import pickle
 from features import compute_rsi
+
 
 def train(timestamp):
     # Config
@@ -47,7 +45,7 @@ def train(timestamp):
     # Export
     os.makedirs(model_dir, exist_ok=True)
 
-    output_dir=f"{model_dir}/{timestamp}"
+    output_dir = f"{model_dir}/{timestamp}"
     os.makedirs(output_dir, exist_ok=True)
 
     with open(f"{output_dir}/scaler_{timestamp}.pkl", "wb") as f:
@@ -65,6 +63,7 @@ def train(timestamp):
     print(f"✅ {symbol} model trained with window={window} and horizon={horizon}")
     print(f"📈 Train CV metrics: {train_metrics}")
     print(f"📈 Eval metrics: {eval_results}")
+
 
 def test(timestamp: str):
     print("Init test")
@@ -130,7 +129,9 @@ def test(timestamp: str):
     pred_next = ort_session.run(
         None,
         {input_name: x_input},
-    )[0]  # shape: (1, n_quantiles)
+    )[
+        0
+    ]  # shape: (1, n_quantiles)
 
     # pred_next → это уже Qτ(log_return_{t+1})
     q_log_returns = pred_next[0]
@@ -141,8 +142,7 @@ def test(timestamp: str):
     last_close = df["close"].iloc[-1]
 
     price_quantiles = {
-        q: last_close * np.exp(q_log_returns[i])
-        for i, q in enumerate(QUANTILES)
+        q: last_close * np.exp(q_log_returns[i]) for i, q in enumerate(QUANTILES)
     }
 
     last_ts = df["ts"].iloc[-1] if "ts" in df.columns else "N/A"
@@ -152,7 +152,6 @@ def test(timestamp: str):
         print(f"Predicted next close (Q{int(q*100)}): {price_quantiles[q]:.2f}")
 
     return price_quantiles
-
 
 
 if __name__ == "__main__":

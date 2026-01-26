@@ -11,7 +11,8 @@ from technical_analysis_trainer.export_onnx import export_model
 from technical_analysis_trainer.trend_model.features import add_features
 from technical_analysis_trainer.trend_model.trend_model import train_trend_lstm
 
-
+# TODO: retrain model and make covrage test
+# TODO: make model predictions more accurate, for now it more like 50/50
 def main():
     # Config
     BASE_DIR = os.path.dirname(__file__)
