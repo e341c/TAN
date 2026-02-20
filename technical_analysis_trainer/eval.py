@@ -1,12 +1,6 @@
 import torch
 import numpy as np
 
-
-def pinball_loss(y_true, y_pred, q):
-    diff = y_true - y_pred
-    return np.mean(np.maximum(q * diff, (q - 1) * diff))
-
-
 def evaluate_model(model, X, y, quantiles=(0.1, 0.5, 0.9)):
     model.eval()
     X_tensor = torch.tensor(X, dtype=torch.float32)

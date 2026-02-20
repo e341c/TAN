@@ -1,7 +1,10 @@
 import torch
+from typing import Any
 
 
-def export_model(model, features, eval_results, output_dir, version, horizon):
+def export_model(
+    model, features, eval_results, output_dir, version, horizon, threshold: float
+):
     model.eval()
     onnx_path = f"{output_dir}/model_{version}.onnx"
 

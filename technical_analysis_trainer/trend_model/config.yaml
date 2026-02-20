@@ -1,14 +1,21 @@
 # General settings
 symbol: BTCUSDT
-data_path: technical_analysis_trainer/data/btcusdt_1h_train.csv
-# data_path: ../data/btcusdt_1h_train.csv
+data_path: technical_analysis_trainer/data/btcusdt_1h.csv
 
 # Model parameters
-epochs: 300
+epochs: 200
 learning_rate: 0.001
-hidden_size: 64
+hidden_size: 32
+num_layers: 1
 
-horizon: 24
+# Data parameters
+threshold: 0.003
+lr: 0.001
+horizon: 3
+# weight_decay: 0.0001
+# threshold: 0.001
+# threshold: 0.002
+# threshold: 0.003
 cv_splits: 5
 n_estimators: 800
 max_depth: 8
@@ -17,3 +24,9 @@ window:
   short: 1
   mid: 12
   long: 30
+
+
+# Models: 
+#   2026-02-19T14-19-41:
+#     num_layers=2, # 2 слоя: лучше уловит сложные паттерны, но нужна большая выборка
+#     dropout=0.2, # регуляризация между слоями LSTM
