@@ -1,32 +1,31 @@
 # General settings
 symbol: BTCUSDT
-data_path: technical_analysis_trainer/data/btcusdt_1h.csv
+data_path: technical_analysis_trainer/data/btcusdt_1h_train.csv
+seed: 1337   # фиксирует случайность: инициализация весов, порядок батчей — одинаковый результат при повторном запуске
 
 # Model parameters
 epochs: 200
 learning_rate: 0.001
 hidden_size: 32
 num_layers: 1
+# Регуляризация: даём модели учиться, переобучение режем early stopping
+weight_decay: 0.0005        # слабый L2 (0.002 держал loss на ~0.69)
+patience: 25                # стоп, когда val_loss не улучшался 25 эпох
+dropout_lstm: 0.2           # только при num_layers > 1
+dropout_fc: 0.3             # dropout перед fc
+batch_size: 64
 
 # Data parameters
-threshold: 0.003
+threshold: 0.003   # порог return для метки UP/DOWN (|return| <= threshold → бар не используется)
+horizon: 1         # на сколько баров вперёд считаем return для таргета
 lr: 0.001
-horizon: 3
-# weight_decay: 0.0001
-# threshold: 0.001
-# threshold: 0.002
-# threshold: 0.003
+# class_weight: auto   # раскомментировать при дисбалансе классов (или задать [w_down, w_up])
 cv_splits: 5
 n_estimators: 800
 max_depth: 8
 output_dir: technical_analysis_trainer/trend_model/models
+# seq_len для LSTM берётся из long. 30 = больше суток — можно попробовать 12 (полдня)
 window:
   short: 1
-  mid: 12
-  long: 30
-
-
-# Models: 
-#   2026-02-19T14-19-41:
-#     num_layers=2, # 2 слоя: лучше уловит сложные паттерны, но нужна большая выборка
-#     dropout=0.2, # регуляризация между слоями LSTM
+  mid: 6
+  long: 24

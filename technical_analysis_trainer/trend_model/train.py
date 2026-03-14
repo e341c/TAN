@@ -1,8 +1,11 @@
+import csv
+import random
 import yaml
 import datetime
 import os
 import pickle
 import numpy as np
+import torch
 
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
@@ -36,6 +39,15 @@ def chronological_split(
     )
 
 
+def set_seed(seed: int):
+    """Фиксирует seed для воспроизводимости: веса модели, порядок батчей."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def main():
     # ── Config ────────────────────────────────────────────────────────────────
     BASE_DIR = os.path.dirname(__file__)
@@ -43,8 +55,11 @@ def main():
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
 
+    set_seed(cfg.get("seed", 42))
+
     symbol = cfg["symbol"]
     threshold = cfg["threshold"]
+    horizon = cfg.get("horizon", 3)
     model_dir = cfg["output_dir"]
     window = cfg.get("window")
     if window is None:
@@ -67,18 +82,42 @@ def main():
 
     # Features: fit scaler только на train
     X_train, y_train, used_features, scaler = add_features(
-        train_df, seq_len=window["long"], threshold=threshold
+        train_df, seq_len=window["long"], threshold=threshold, horizon=horizon
     )
     X_val, y_val, _, _ = add_features(
-        val_df, seq_len=window["long"], threshold=threshold, scaler=scaler
+        val_df, seq_len=window["long"], threshold=threshold, horizon=horizon, scaler=scaler
     )
     X_test, y_test, _, _ = add_features(
-        test_df, seq_len=window["long"], threshold=threshold, scaler=scaler
+        test_df, seq_len=window["long"], threshold=threshold, horizon=horizon, scaler=scaler
     )
 
-    print("Train:", np.bincount(y_train))  # [DOWN_count, UP_count]
-    print("Val:  ", np.bincount(y_val))
-    print("Test: ", np.bincount(y_test))
+    # Баланс классов (0=DOWN, 1=UP)
+    btrain = np.bincount(y_train, minlength=2)
+    bval = np.bincount(y_val, minlength=2)
+    btest = np.bincount(y_test, minlength=2)
+    n_train = len(y_train)
+    pct_down_train = btrain[0] / n_train * 100 if n_train else 0
+    pct_up_train = btrain[1] / n_train * 100 if n_train else 0
+    print("Train:", btrain, f"  (DOWN {pct_down_train:.1f}% | UP {pct_up_train:.1f}%)")
+    print("Val:  ", bval)
+    print("Test: ", btest)
+    class_weight_cfg = cfg.get("class_weight")
+    if class_weight_cfg == "auto":
+        n0, n1 = max(btrain[0], 1), max(btrain[1], 1)
+        cfg = {**cfg, "class_weight": [n_train / (2 * n0), n_train / (2 * n1)]}
+        print("Class weights (auto):", [f"{w:.3f}" for w in cfg["class_weight"]], "  [DOWN, UP]")
+    elif abs(pct_down_train - 50) > 5:
+        print(
+            f"  ⚠ Train class imbalance >5% (DOWN {pct_down_train:.1f}%). "
+            "Consider class_weight: auto or class_weight: [w_down, w_up] in config."
+        )
+
+    # Тренд в обучающей выборке (вся train-эпоха)
+    if "close" in train_df.columns and len(train_df) > 0:
+        train_return = (train_df["close"].iloc[-1] - train_df["close"].iloc[0]) / train_df["close"].iloc[0]
+        ts_start = train_df["ts"].iloc[0] if "ts" in train_df.columns else "?"
+        ts_end = train_df["ts"].iloc[-1] if "ts" in train_df.columns else "?"
+        print(f"Train period: {ts_start} → {ts_end}  (total return: {train_return*100:+.2f}%)")
 
     print("X_train min:", X_train.min())
     print("X_train max:", X_train.max())
@@ -123,7 +162,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     with open(f"{output_dir}/scaler_{timestamp}.pkl", "wb") as f:
-        pickle.dump(scaler, f)
+        pickle.dump({"scaler": scaler, "features": used_features}, f)
 
     export_model(
         model=model,
@@ -139,6 +178,53 @@ def main():
     print(f"✅ {symbol} | window={window['long']} | threshold={threshold}")
     print(f"📈 Train metrics : {train_metrics['classes']}")
     print(f"📊 Test  metrics : {eval_results}")
+
+    # ── Лог в CSV для сравнения запусков ──────────────────────────────────────
+    train_start_ts = str(train_df["ts"].iloc[0]) if "ts" in train_df.columns and len(train_df) else ""
+    train_end_ts = str(train_df["ts"].iloc[-1]) if "ts" in train_df.columns and len(train_df) else ""
+    train_return_pct = (
+        (train_df["close"].iloc[-1] - train_df["close"].iloc[0]) / train_df["close"].iloc[0] * 100
+        if "close" in train_df.columns and len(train_df) > 0
+        else None
+    )
+    cm = eval_results.get("confusion_matrix", [])
+    cm_str = str(cm) if cm else ""
+
+    row = {
+        "timestamp": timestamp,
+        "seed": cfg.get("seed", ""),
+        "window_long": window["long"],
+        "horizon": horizon,
+        "threshold": threshold,
+        "hidden_size": cfg.get("hidden_size", ""),
+        "epochs": cfg.get("epochs", ""),
+        "patience": cfg.get("patience", ""),
+        "weight_decay": cfg.get("weight_decay", ""),
+        "dropout_fc": cfg.get("dropout_fc", ""),
+        "n_train": n_train,
+        "n_val": len(y_val),
+        "n_test": len(y_test),
+        "train_start": train_start_ts,
+        "train_end": train_end_ts,
+        "train_return_pct": train_return_pct,
+        "accuracy": eval_results.get("accuracy", ""),
+        "f1": eval_results.get("f1", ""),
+        "precision": eval_results.get("precision", ""),
+        "recall": eval_results.get("recall", ""),
+        "roc_auc": eval_results.get("roc_auc", ""),
+        "confusion_matrix": cm_str,
+        "best_val_loss": train_metrics.get("best_val_loss", ""),
+        "best_epoch": train_metrics.get("best_epoch", ""),
+        "stopped_early": train_metrics.get("stopped_early", ""),
+    }
+    runs_csv = os.path.join(BASE_DIR, "train_runs.csv")
+    file_exists = os.path.isfile(runs_csv)
+    with open(runs_csv, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"📋 Run logged to {runs_csv}")
 
 
 if __name__ == "__main__":
