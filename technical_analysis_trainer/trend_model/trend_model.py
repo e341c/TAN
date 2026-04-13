@@ -69,7 +69,7 @@ def train_trend_lstm(
 
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=cfg.get("lr", 3e-4),
+        lr=cfg.get("learning_rate", 3e-4),
         weight_decay=cfg.get("weight_decay", 1e-4),
     )
     class_weight = cfg.get("class_weight")

@@ -1,5 +1,6 @@
 import csv
 import random
+import secrets
 import yaml
 import datetime
 import os
@@ -8,7 +9,7 @@ import numpy as np
 import torch
 
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score, accuracy_score, confusion_matrix
 
 from technical_analysis_trainer.dataset import load_dataset
 from technical_analysis_trainer.export_onnx import export_model
@@ -48,15 +49,26 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def main():
-    # ── Config ────────────────────────────────────────────────────────────────
-    BASE_DIR = os.path.dirname(__file__)
-    cfg_path = os.getenv("CONFIG_PATH", os.path.join(BASE_DIR, "config.yaml"))
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
+def resolve_seed_into_cfg(cfg: dict) -> None:
+    """
+    При seed: auto в YAML — генерирует целый seed, пишет в cfg и вызывает set_seed.
+    Иначе приводит seed к int (по умолчанию 42, если ключа нет).
+    """
+    raw = cfg.get("seed", 42)
+    if isinstance(raw, str) and raw.strip().lower() == "auto":
+        seed = secrets.randbelow(2**31)
+        print(f"🎲 seed: auto → {seed}")
+    else:
+        try:
+            seed = int(raw)
+        except (TypeError, ValueError):
+            seed = 42
+            print(f"⚠ invalid seed {raw!r}, using {seed}")
+    cfg["seed"] = seed
+    set_seed(seed)
 
-    set_seed(cfg.get("seed", 42))
 
+def train_one_run(cfg: dict, base_dir: str) -> None:
     symbol = cfg["symbol"]
     threshold = cfg["threshold"]
     horizon = cfg.get("horizon", 3)
@@ -130,10 +142,27 @@ def main():
     X_flat_train = X_train[:, -1, :]  # только последний бар окна
     X_flat_test  = X_test[:, -1, :]
 
-    gb = GradientBoostingClassifier(n_estimators=100)
+    gb = GradientBoostingClassifier(n_estimators=cfg.get("n_estimators", 100))
     gb.fit(X_flat_train, y_train)
-    pred = gb.predict_proba(X_flat_test)[:, 1]
-    print("GBM ROC-AUC:", roc_auc_score(y_test, pred))
+    # pred = gb.predict_proba(X_flat_test)[:, 1]
+    # print("GBM ROC-AUC:", roc_auc_score(y_test, pred))
+    # print("GBM F1:", f1_score(y_test, pred))
+    # print("GBM Precision:", precision_score(y_test, pred))
+    # print("GBM Recall:", recall_score(y_test, pred))
+    # print("GBM Accuracy:", accuracy_score(y_test, pred))
+    # print("GBM Confusion Matrix:", confusion_matrix(y_test, pred))
+    # print("GBM Best Val Loss:", gb.best_val_loss_)
+    # print("GBM Best Epoch:", gb.best_epoch_)
+
+    proba_up = gb.predict_proba(X_flat_test)[:, 1]
+    y_pred = (proba_up >= 0.5).astype(int)
+
+    print("GBM ROC-AUC:", roc_auc_score(y_test, proba_up))
+    print("GBM F1:", f1_score(y_test, y_pred))
+    print("GBM Precision:", precision_score(y_test, y_pred))
+    print("GBM Recall:", recall_score(y_test, y_pred))
+    print("GBM Accuracy:", accuracy_score(y_test, y_pred))
+    print("GBM Confusion Matrix:", confusion_matrix(y_test, y_pred).tolist())
 
 
     # ── Class distribution ────────────────────────────────────────────────────
@@ -192,7 +221,7 @@ def main():
 
     row = {
         "timestamp": timestamp,
-        "seed": cfg.get("seed", ""),
+        "seed": cfg["seed"],
         "window_long": window["long"],
         "horizon": horizon,
         "threshold": threshold,
@@ -216,8 +245,20 @@ def main():
         "best_val_loss": train_metrics.get("best_val_loss", ""),
         "best_epoch": train_metrics.get("best_epoch", ""),
         "stopped_early": train_metrics.get("stopped_early", ""),
+        "learning_rate": cfg.get("learning_rate", ""),
+        "num_layers": cfg.get("num_layers", ""),
+        "dropout_lstm": cfg.get("dropout_lstm", ""),
+        "batch_size": cfg.get("batch_size", ""),
+        "class_weight": cfg.get("class_weight", ""),
+        "n_estimators": cfg.get("n_estimators", ""),
+        "GBM ROC-AUC": roc_auc_score(y_test, proba_up),
+        "GBM F1": f1_score(y_test, y_pred),
+        "GBM Precision": precision_score(y_test, y_pred),
+        "GBM Recall": recall_score(y_test, y_pred),
+        "GBM Accuracy": accuracy_score(y_test, y_pred),
+        "GBM Confusion Matrix": confusion_matrix(y_test, y_pred).tolist(),
     }
-    runs_csv = os.path.join(BASE_DIR, "train_runs.csv")
+    runs_csv = os.path.join(base_dir, "train_runs.csv")
     file_exists = os.path.isfile(runs_csv)
     with open(runs_csv, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=row.keys())
@@ -225,6 +266,22 @@ def main():
             writer.writeheader()
         writer.writerow(row)
     print(f"📋 Run logged to {runs_csv}")
+
+
+def main():
+    base_dir = os.path.dirname(__file__)
+    cfg_path = os.getenv("CONFIG_PATH", os.path.join(base_dir, "config.yaml"))
+
+    while True:
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+
+        continuous = bool(cfg.get("continuous_training", False))
+        resolve_seed_into_cfg(cfg)
+        train_one_run(cfg, base_dir)
+
+        if not continuous:
+            break
 
 
 if __name__ == "__main__":

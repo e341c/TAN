@@ -8,7 +8,7 @@ from features import add_features
 import pickle
 from eval import evaluate_model
 
-
+# модель неплохо попадает в цены, только для up тренда она чуть больше берет прибыль, чем down тренд, если правильно угадывать тренд, то в целом можно делать какой-то фронт для предсказаний
 def main():
     # Config
     cfg_path = os.getenv("CONFIG_PATH", "config.yaml")
