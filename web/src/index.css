@@ -1,0 +1,76 @@
+:root {
+  --bg: #07080d;
+  --bg-gradient-purple: rgba(139, 92, 246, 0.1);
+  --bg-gradient-teal: rgba(34, 211, 238, 0.08);
+
+  --surface: rgba(255, 255, 255, 0.03);
+  --surface-elevated: rgba(255, 255, 255, 0.05);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.12);
+
+  --text: #f4f4f5;
+  --text-muted: #a1a1aa;
+  --text-subtle: #71717a;
+
+  --accent-from: #8b5cf6;
+  --accent-to: #22d3ee;
+  --accent-glow: rgba(139, 92, 246, 0.35);
+
+  --up: #34d399;
+  --up-bg: rgba(52, 211, 153, 0.15);
+  --down: #f87171;
+  --down-bg: rgba(248, 113, 113, 0.15);
+
+  --error: #f87171;
+  --error-border: rgba(248, 113, 113, 0.4);
+  --error-bg: rgba(248, 113, 113, 0.08);
+
+  --chart-bg: #0c0d12;
+  --chart-grid: rgba(255, 255, 255, 0.06);
+  --chart-text: #a1a1aa;
+  --chart-q10: #f87171;
+  --chart-q50: #a78bfa;
+  --chart-q90: #34d399;
+  --chart-up: #34d399;
+  --chart-down: #f87171;
+
+  --radius-card: 12px;
+  --radius-pill: 9999px;
+
+  --font: "Inter", system-ui, -apple-system, sans-serif;
+  --max-width: 1120px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font);
+  line-height: 1.5;
+  color: var(--text);
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(
+      ellipse 80% 50% at 50% -20%,
+      var(--bg-gradient-purple),
+      transparent
+    ),
+    radial-gradient(
+      ellipse 60% 40% at 100% 0%,
+      var(--bg-gradient-teal),
+      transparent
+    );
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button {
+  font-family: inherit;
+}
+
+#root {
+  min-height: 100vh;
+}

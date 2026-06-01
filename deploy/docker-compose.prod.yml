@@ -1,0 +1,13 @@
+# Production: use GHCR images (set TAN_API_IMAGE / TAN_WEB_IMAGE in deploy/.env)
+# docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml pull
+# docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml up -d --no-build
+
+services:
+  migrate:
+    image: ${TAN_API_IMAGE}
+  api:
+    image: ${TAN_API_IMAGE}
+  web:
+    image: ${TAN_WEB_IMAGE}
+  scheduler:
+    image: ${TAN_API_IMAGE}

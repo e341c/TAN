@@ -1,11 +1,17 @@
 import torch
+from typing import Any
 
 
-def export_model(model, features, eval_results, output_dir, version, horizon):
+def export_model(
+    model, features, eval_results, output_dir, version, horizon
+):
+    """
+    horizon здесь — длина окна (seq_len), как в config window.long.
+    """
     model.eval()
     onnx_path = f"{output_dir}/model_{version}.onnx"
 
-    dummy_input = torch.randn(1, 30, len(features))  # 30 — фиксированное окно
+    dummy_input = torch.randn(1, horizon, len(features))  # (batch, seq_len, features)
     print("dummy_input", dummy_input.shape)
     torch.onnx.export(
         model,

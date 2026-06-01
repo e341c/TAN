@@ -2,9 +2,10 @@ import torch
 import numpy as np
 
 
-def pinball_loss(y_true, y_pred, q):
-    diff = y_true - y_pred
-    return np.mean(np.maximum(q * diff, (q - 1) * diff))
+def pinball_loss(y_true, y_pred, q: float) -> float:
+    """Mean pinball loss for one quantile (matches QuantileLoss per-head term)."""
+    err = np.asarray(y_true, dtype=np.float64).ravel() - np.asarray(y_pred, dtype=np.float64).ravel()
+    return float(np.mean(np.maximum((q - 1.0) * err, q * err)))
 
 
 def evaluate_model(model, X, y, quantiles=(0.1, 0.5, 0.9)):
