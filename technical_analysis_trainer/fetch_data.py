@@ -52,9 +52,18 @@ def fetch_klines(symbol: str, interval: str, months: int) -> pd.DataFrame:
         "close_time", "quote_asset_volume", "trades",
         "taker_buy_base", "taker_buy_quote", "ignore",
     ])
-    df = df[["ts", "open", "high", "low", "close", "volume"]]
+    df = df[["ts", "open", "high", "low", "close", "volume", "trades"]]
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
+    df = df.astype(
+        {
+            "open": float,
+            "high": float,
+            "low": float,
+            "close": float,
+            "volume": float,
+            "trades": int,
+        }
+    )
     df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
 
     return df
@@ -158,6 +167,15 @@ if __name__ == "__main__":
     parser.add_argument("--months",   type=int, default=6)
     parser.add_argument("--output",   type=str, default="./data")
     parser.add_argument("--no-funding", action="store_true", help="Skip funding rate fetch")
+    parser.add_argument(
+        "--also",
+        nargs="*",
+        default=[],
+        metavar="SYMBOL",
+        help="Additional symbols (klines only, no funding) for cross-market CSVs, e.g. ETHUSDT SOLUSDT",
+    )
     args = parser.parse_args()
 
     fetch_data(args.symbol, args.interval, args.months, args.output, with_funding=not args.no_funding)
+    for extra in args.also:
+        fetch_data(extra, args.interval, args.months, args.output, with_funding=False)

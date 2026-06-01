@@ -3,7 +3,7 @@ from typing import Any
 
 
 def export_model(
-    model, features, eval_results, output_dir, version, horizon, threshold: float
+    model, features, eval_results, output_dir, version, horizon
 ):
     """
     horizon здесь — длина окна (seq_len), как в config window.long.

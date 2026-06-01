@@ -1,0 +1,2 @@
+# UTC — 5 min after each hour (closed 1h candle on Binance)
+5 * * * * cd /app && PYTHONPATH=/app python -m technical_analysis_trainer.run_scheduled_prediction >> /var/log/scheduled_predict.log 2>&1

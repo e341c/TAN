@@ -1,1 +1,10 @@
 /typings
+/artifacts
+/data
+
+web/node_modules/
+web/dist/
+
+.env.predict
+deploy/.env
+logs/

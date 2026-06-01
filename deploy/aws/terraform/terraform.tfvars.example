@@ -1,0 +1,6 @@
+aws_region        = "us-east-1"
+admin_cidr        = "YOUR_IP/32"
+ssh_public_key    = "ssh-ed25519 AAAA... you@host"
+repo_url          = "https://github.com/YOUR_USER/tan-model.git"
+repo_branch       = "main"
+postgres_password = "generate-a-strong-password"

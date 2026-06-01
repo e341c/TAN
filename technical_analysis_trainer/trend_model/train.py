@@ -15,8 +15,39 @@ from technical_analysis_trainer.dataset import load_dataset
 from technical_analysis_trainer.export_onnx import export_model
 
 from technical_analysis_trainer.trend_model.eval import evaluate_model
-from technical_analysis_trainer.trend_model.features import add_features
+from technical_analysis_trainer.trend_model.features import (
+    add_features,
+    attach_cross_market_features,
+    attach_mtf_features,
+    resolve_feature_scale_clip,
+)
 from technical_analysis_trainer.trend_model.trend_model import train_trend_lstm
+
+
+def append_train_runs_row(runs_csv: str, row: dict) -> None:
+    """
+    Append one run to train_runs.csv, preserving existing rows.
+    Merges header with any new keys (e.g. after adding columns in a newer version).
+    """
+    fieldnames: list[str] = []
+    old_rows: list[dict] = []
+    if os.path.isfile(runs_csv):
+        with open(runs_csv, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames:
+                fieldnames = list(reader.fieldnames)
+            old_rows = list(reader)
+    for k in row:
+        if k not in fieldnames:
+            fieldnames.append(k)
+    out_rows = []
+    for r in old_rows:
+        out_rows.append({k: r.get(k, "") for k in fieldnames})
+    out_rows.append({k: row.get(k, "") for k in fieldnames})
+    with open(runs_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(out_rows)
 
 
 def chronological_split(
@@ -80,6 +111,15 @@ def train_one_run(cfg: dict, base_dir: str) -> None:
     # ── Dataset ───────────────────────────────────────────────────────────────
     df = load_dataset(cfg["data_path"])
 
+    cross_cfg = cfg.get("cross_market")
+    if (cross_cfg or {}).get("enabled", False):
+        df = attach_cross_market_features(df, cross_cfg)
+
+    # MTF (4H/1D) на полном ряду до split — иначе ресемпл/окна обрежутся на границах сплитов
+    mtf_cfg = cfg.get("mtf")
+    if (mtf_cfg or {}).get("enabled", True):
+        df = attach_mtf_features(df, mtf_cfg)
+
     # Сначала делаем хронологический split по сырому датафрейму,
     # чтобы scaler обучался только на train-части (нет leakage)
     n = len(df)
@@ -92,15 +132,41 @@ def train_one_run(cfg: dict, base_dir: str) -> None:
     val_df = df.iloc[val_idx:test_idx].reset_index(drop=True)
     test_df = df.iloc[test_idx:].reset_index(drop=True)
 
+    clip_lo, clip_hi = resolve_feature_scale_clip(cfg)
+    print(f"Feature scale clip (after StandardScaler): [{clip_lo}, {clip_hi}]")
+
     # Features: fit scaler только на train
     X_train, y_train, used_features, scaler = add_features(
-        train_df, seq_len=window["long"], threshold=threshold, horizon=horizon
+        train_df,
+        seq_len=window["long"],
+        threshold=threshold,
+        horizon=horizon,
+        mtf_cfg=mtf_cfg,
+        cross_market_cfg=cross_cfg,
+        clip_low=clip_lo,
+        clip_high=clip_hi,
     )
     X_val, y_val, _, _ = add_features(
-        val_df, seq_len=window["long"], threshold=threshold, horizon=horizon, scaler=scaler
+        val_df,
+        seq_len=window["long"],
+        threshold=threshold,
+        horizon=horizon,
+        scaler=scaler,
+        mtf_cfg=mtf_cfg,
+        cross_market_cfg=cross_cfg,
+        clip_low=clip_lo,
+        clip_high=clip_hi,
     )
     X_test, y_test, _, _ = add_features(
-        test_df, seq_len=window["long"], threshold=threshold, horizon=horizon, scaler=scaler
+        test_df,
+        seq_len=window["long"],
+        threshold=threshold,
+        horizon=horizon,
+        scaler=scaler,
+        mtf_cfg=mtf_cfg,
+        cross_market_cfg=cross_cfg,
+        clip_low=clip_lo,
+        clip_high=clip_hi,
     )
 
     # Баланс классов (0=DOWN, 1=UP)
@@ -191,7 +257,15 @@ def train_one_run(cfg: dict, base_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     with open(f"{output_dir}/scaler_{timestamp}.pkl", "wb") as f:
-        pickle.dump({"scaler": scaler, "features": used_features}, f)
+        pickle.dump(
+            {
+                "scaler": scaler,
+                "features": used_features,
+                "scale_clip_min": clip_lo,
+                "scale_clip_max": clip_hi,
+            },
+            f,
+        )
 
     export_model(
         model=model,
@@ -200,7 +274,6 @@ def train_one_run(cfg: dict, base_dir: str) -> None:
         output_dir=output_dir,
         version=timestamp,
         horizon=window["long"],
-        threshold=threshold,
     )
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -222,9 +295,12 @@ def train_one_run(cfg: dict, base_dir: str) -> None:
     row = {
         "timestamp": timestamp,
         "seed": cfg["seed"],
+        "n_features": len(used_features),
         "window_long": window["long"],
         "horizon": horizon,
         "threshold": threshold,
+        "scale_clip_min": clip_lo,
+        "scale_clip_max": clip_hi,
         "hidden_size": cfg.get("hidden_size", ""),
         "epochs": cfg.get("epochs", ""),
         "patience": cfg.get("patience", ""),
@@ -259,12 +335,7 @@ def train_one_run(cfg: dict, base_dir: str) -> None:
         "GBM Confusion Matrix": confusion_matrix(y_test, y_pred).tolist(),
     }
     runs_csv = os.path.join(base_dir, "train_runs.csv")
-    file_exists = os.path.isfile(runs_csv)
-    with open(runs_csv, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
+    append_train_runs_row(runs_csv, row)
     print(f"📋 Run logged to {runs_csv}")
 
 

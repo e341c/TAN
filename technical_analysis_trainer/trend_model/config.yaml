@@ -1,6 +1,6 @@
 # General settings
 symbol: BTCUSDT
-data_path: technical_analysis_trainer/data/btcusdt_1h_all_time.csv
+data_path: technical_analysis_trainer/data/train/btcusdt_1h_train.csv
 # seed: число — воспроизводимый запуск; seed: auto — новый seed каждый прогон (см. train.py resolve_seed_into_cfg)
 seed: auto
 # Непрерывное обучение: после каждого сохранения модели снова читается этот конфиг и стартует новый прогон (Ctrl+C — стоп)
@@ -8,26 +8,87 @@ continuous_training: true
 
 # Model parameters
 epochs: 200
-learning_rate: 0.0005
-hidden_size: 32
+# learning rate: скорость обучения.
+# Пример: 0.0005 — средняя скорость; меньше → медленнее обучение; больше → риск переобучения.
+learning_rate: 0.00055
+# размер скрытого состояния LSTM (ёмкость модели).
+# Пример: 32 — относительно компактно; больше → больше параметров, выше риск переобучения.
+hidden_size: 64
+# количество слоев LSTM. Пример: 2 — достаточно для большинства задач; больше → больше параметров, выше риск переобучения.
 num_layers: 2
 # Регуляризация: даём модели учиться, переобучение режем early stopping
-weight_decay: 0.0005        # слабый L2 (0.002 держал loss на ~0.69)
-patience: 25                # стоп, когда val_loss не улучшался 25 эпох
-dropout_lstm: 0.2           # только при num_layers > 1
-dropout_fc: 0.1             # dropout перед fc
+# L2‑регуляризация (штраф за большие веса).
+weight_decay: 0.0005
+# стоп, когда val_loss не улучшался 25 эпох
+patience: 25                
+# dropout перед fc (регуляризация). Пример: 0.1 — слабое регуляризация;
+# больше → больше регуляризация, меньше риск переобучения. Только при num_layers > 1
+dropout_lstm: 0.2
+# dropout перед финальным полносвязным слоем (регуляризация).
+# Пример: 0.1 — слабое регуляризация; больше → больше регуляризация, меньше риск переобучения.
+dropout_fc: 0.1
+# размер батча. Пример: 64 — достаточно для большинства задач; больше → больше памяти, меньше риск переобучения.
 batch_size: 64
 
 # Data parameters
-threshold: 0.001   # порог return для метки UP/DOWN (|return| <= threshold → бар не используется)
-horizon: 1         # на сколько баров вперёд считаем return для таргета
-class_weight: auto   # раскомментировать при дисбалансе классов (или задать [w_down, w_up])
+# порог return для метки UP/DOWN (|return| <= threshold → бар не используется)
+threshold: 0.001
+# После StandardScaler: обрезка каждой фичи в [min, max] (в σ train). Число → симметрично [-x, x].
+# Иначе dict: { min: -5, max: 8 }. Логируется в train_runs.csv и в scaler_*.pkl для инференса.
+feature_scale_clip: 4
+# на сколько баров вперёд считаем return для таргета
+horizon: 1
+# раскомментировать при дисбалансе классов (или задать [w_down, w_up])
+class_weight: auto
+# количество деревьев в Random Forest. Пример: 100 — достаточно для большинства задач; больше → больше памяти, меньше риск переобучения.
 n_estimators: 100
+# максимальная глубина дерева. Пример: 8 — достаточно для большинства задач; больше → больше памяти, меньше риск переобучения.
 max_depth: 8
+# количество фолдов для кросс-валидации. Пример: 5 — достаточно для большинства задач; больше → больше памяти, меньше риск переобучения.
 cv_splits: 5
+# директория для сохранения моделей.
 output_dir: technical_analysis_trainer/trend_model/models
 # seq_len для LSTM берётся из long. 30 = больше суток — можно попробовать 12 (полдня)
 window:
   short: 1
   mid: 6
   long: 24
+
+# Мульти‑таймфрейм: 4H/1D → as-of на 1H (ts = open time), без lookahead; см. features.attach_mtf_features
+mtf:
+  enabled: true
+  rsi_period: 14
+  ret_window_4h: 14
+  rv_window_4h: 14
+  vwap_window_4h: 14
+  ret_window_1d: 14
+  rv_window_1d: 14
+  vwap_window_1d: 14
+
+# Кросс‑рынок: лог‑доходности бенчмарков/макро, спред main−bench, rolling corr(main, bench).
+# Включите enabled: true и заполните path (пустая строка = источник пропускается).
+# ETH/SOL: см. fetch_data.py --also. BTC.D / USDT.D / DXY — внешние CSV с ts + close (или OHLCV).
+cross_market:
+  enabled: true
+  merge_tolerance: 7D
+  benchmarks:
+    eth:
+      path: technical_analysis_trainer/data/train/ethusdt_1h_train.csv
+    sol:
+      path: technical_analysis_trainer/data/train/solusdt_1h_train.csv
+    alt_index:
+      path: ""
+    btc_d:
+      path: ""
+    usdt_d:
+      path: ""
+  macro:
+    dxy:
+      path: technical_analysis_trainer/data/train/macro_dtwexbgs_1d_train.csv
+    risk_proxy:
+      path: technical_analysis_trainer/data/train/macro_vixcls_1d_train.csv
+  corr:
+    benchmark: eth
+    windows: [24, 72, 168]
+  spread_main_minus:
+    - eth

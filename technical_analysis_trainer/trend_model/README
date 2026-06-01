@@ -114,3 +114,64 @@ recall = 480/(480+20) = 0.96
 f1 ≈ 2 * (0.516*0.96)/(0.516+0.96) ≈ 0.672
 Видишь, F1 выглядит “норм”, recall очень высокий, но модель генерирует кучу ложных UP (FP), и такая 
 стратегия может быть бесполезной для трейдинга (комиссии/проскальзывание/убытки на ложных входах).
+
+---
+
+График метрик (интерактивно)
+
+Если хочешь посмотреть “профиль” метрик для каждого запуска (каждый `timestamp` = отдельная линия, по X = метрики), используй:
+
+```bash
+python technical_analysis_trainer/trend_model/plot_train_runs.py
+```
+
+Можно сохранить HTML (удобно шарить/открывать без Python):
+
+```bash
+python technical_analysis_trainer/trend_model/plot_train_runs.py --out artifacts/train_runs.html
+```
+
+Если линий слишком много, можно взять только последние N запусков:
+
+```bash
+python technical_analysis_trainer/trend_model/plot_train_runs.py --latest 10
+```
+
+Режим “метрики во времени” (по X = `timestamp`, каждая метрика = отдельная линия):
+
+```bash
+python technical_analysis_trainer/trend_model/plot_train_runs.py --mode time
+```
+
+Временные ряды всех признаков модели (`build_features_df`, те же колонки, что уходят в scaler/LSTM). По умолчанию **один график**: все линии в одних осях; по Y — z-score по каждой фиче на выбранном окне, чтобы масштабы не «съедали» друг друга:
+
+```bash
+python technical_analysis_trainer/trend_model/plot_model_features.py
+```
+
+Сырые значения на одной оси (одна фича может визуально доминировать):
+
+```bash
+python technical_analysis_trainer/trend_model/plot_model_features.py --y-scale raw
+```
+
+Отдельная полоса на фичу (как раньше):
+
+```bash
+python technical_analysis_trainer/trend_model/plot_model_features.py --layout subplots
+```
+
+Сохранить HTML и взять только последние 2000 баров (меньше размер файла):
+
+```bash
+python technical_analysis_trainer/trend_model/plot_model_features.py --out artifacts/features_timeseries.html --tail 2000
+```
+
+Проверка масштабирования как в `train.py` (scaler на train, клип из `feature_scale_clip`): CSV и сводка в консоль — сырой разброс, доля `z_pre` вне клипа до обрезки, перцентили в окнах LSTM:
+
+```bash
+python technical_analysis_trainer/trend_model/audit_scaled_features.py
+python technical_analysis_trainer/trend_model/audit_scaled_features.py --out-csv artifacts/scaled_feature_audit.csv
+```
+
+Граница клипа после `StandardScaler` задаётся в `config.yaml` как `feature_scale_clip` (число → симметрично, или `{ min, max }`). После каждого train в `train_runs.csv` пишутся колонки `scale_clip_min`, `scale_clip_max`; те же значения лежат в `scaler_*.pkl` для инференса.

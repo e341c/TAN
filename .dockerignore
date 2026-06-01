@@ -1,0 +1,12 @@
+.git
+.github
+**/__pycache__
+**/*.pyc
+**/.DS_Store
+web/node_modules
+web/dist
+logs
+deploy/.env
+.env.predict
+*.md
+.cursor

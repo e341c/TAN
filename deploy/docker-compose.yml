@@ -1,0 +1,127 @@
+# Full stack: postgres, migrate, api, web, scheduler
+# From repo root: docker compose -f deploy/docker-compose.yml --env-file deploy/.env up --build
+
+name: tan
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tan}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tan}
+      POSTGRES_DB: ${POSTGRES_DB:-tan_predictions}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-tan} -d ${POSTGRES_DB:-tan_predictions}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - tan_net
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.api
+    image: ${TAN_API_IMAGE:-tan-api:local}
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    command: python -c "from technical_analysis_trainer.prediction_store import init_db; init_db()"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - tan_net
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.api
+    image: ${TAN_API_IMAGE:-tan-api:local}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      QUANTILE_MODEL_RUN: ${QUANTILE_MODEL_RUN}
+      TREND_MODEL_RUN: ${TREND_MODEL_RUN:-}
+      TREND_REALTIME_CONFIG: ${TREND_REALTIME_CONFIG}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1}
+      PYTHONPATH: /app
+    volumes:
+      - ../technical_analysis_trainer/quantile_model/models:/app/technical_analysis_trainer/quantile_model/models:ro
+      - ../technical_analysis_trainer/trend_model/models:/app/technical_analysis_trainer/trend_model/models:ro
+      - ../technical_analysis_trainer/data:/app/technical_analysis_trainer/data:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - tan_net
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.web
+    image: ${TAN_WEB_IMAGE:-tan-web:local}
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-80}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - tan_net
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.api
+    image: ${TAN_API_IMAGE:-tan-api:local}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      QUANTILE_MODEL_RUN: ${QUANTILE_MODEL_RUN}
+      TREND_MODEL_RUN: ${TREND_MODEL_RUN:-}
+      TREND_REALTIME_CONFIG: ${TREND_REALTIME_CONFIG}
+      PREDICTION_SYMBOL: ${PREDICTION_SYMBOL:-BTCUSDT}
+      PREDICTION_INTERVAL: ${PREDICTION_INTERVAL:-1h}
+      PREDICTION_BINANCE_LIMIT: ${PREDICTION_BINANCE_LIMIT:-45}
+      PYTHONPATH: /app
+    volumes:
+      - ../technical_analysis_trainer/quantile_model/models:/app/technical_analysis_trainer/quantile_model/models:ro
+      - ../technical_analysis_trainer/trend_model/models:/app/technical_analysis_trainer/trend_model/models:ro
+      - ../technical_analysis_trainer/data:/app/technical_analysis_trainer/data:ro
+      - scheduler_logs:/var/log
+    command: ["/usr/local/bin/supercronic", "/etc/crontab"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks:
+      - tan_net
+
+volumes:
+  pgdata:
+  scheduler_logs:
+
+networks:
+  tan_net:
+    driver: bridge

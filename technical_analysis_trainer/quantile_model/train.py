@@ -1,17 +1,24 @@
 # main.py
-import numpy as np
-from dataset import load_dataset
-from export_onnx import export_model
+# import numpy as np
 import yaml, datetime, os
-from quantile_model import train_quantile_lstm
-from features import add_features
 import pickle
-from eval import evaluate_model
+# from dataset import load_dataset
+# from export_onnx import export_model
+# from quantile_model import train_quantile_lstm
+# from features import add_features
+# from eval import evaluate_model
+from technical_analysis_trainer.dataset import load_dataset
+from technical_analysis_trainer.export_onnx import export_model
+from technical_analysis_trainer.quantile_model.features import add_features
+from technical_analysis_trainer.quantile_model.eval import evaluate_model
+from technical_analysis_trainer.quantile_model.quantile_model import train_quantile_lstm
 
 # модель неплохо попадает в цены, только для up тренда она чуть больше берет прибыль, чем down тренд, если правильно угадывать тренд, то в целом можно делать какой-то фронт для предсказаний
 def main():
     # Config
-    cfg_path = os.getenv("CONFIG_PATH", "config.yaml")
+    base_dir = os.path.dirname(__file__)
+    cfg_path = os.getenv("CONFIG_PATH", os.path.join(base_dir, "config.yaml"))
+    # cfg_path = os.getenv("CONFIG_PATH", "config.yaml")
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
 

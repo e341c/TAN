@@ -1,10 +1,10 @@
 # General settings
 symbol: BTCUSDT
-data_path: ./data/btcusdt_1h_train.csv
+data_path: technical_analysis_trainer/data/btcusdt_1h_train.csv
 
 # Model parameters
 # epochs: 50
-epochs: 300
+epochs: 100
 learning_rate: 0.001
 hidden_size: 64
 
@@ -12,8 +12,8 @@ horizon: 24
 cv_splits: 5
 n_estimators: 800
 max_depth: 8
-output_dir: ./models
+output_dir: technical_analysis_trainer/quantile_model/models
 window:
   short: 1
   mid: 12
-  long: 30
+  long: 24
