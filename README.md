@@ -38,14 +38,14 @@ quant-regressor/
 
 ## Prediction dashboard (local)
 
-Backend serves JSON (`candles`, quantile forecast for the next hour, trend probabilities). The trend pipeline still needs the predict CSV path from [`technical_analysis_trainer/trend_model/test_config.yaml`](technical_analysis_trainer/trend_model/test_config.yaml) (`data_path`) and ONNX/scaler under `trend_model/models/`. The quantile branch expects scaler/ONNX under `technical_analysis_trainer/quantile_model/models/{QUANTILE_MODEL_RUN}/` (override with env `QUANTILE_MODEL_RUN` if your run id differs).
+Backend serves JSON (`candles`, live quantile forecast for the next hour, trend probabilities, and optional `quantile_history` from PostgreSQL). When `DATABASE_URL` is set and the scheduler has written rows, `/api/snapshot` includes past quantile forecasts for the visible candle window; the chart draws them as faded dashed segments. The trend pipeline needs the predict CSV from [`technical_analysis_trainer/models/trend/test_config.yaml`](technical_analysis_trainer/models/trend/test_config.yaml) (`data_path`) and ONNX/scaler under `models/trend/models/`. Quantile artifacts live under `technical_analysis_trainer/models/quantile/models/{QUANTILE_MODEL_RUN}/` (env `QUANTILE_MODEL_RUN`).
 
 From the **repository root** (`tan-model/`):
 
 1. API (port 8001):
 
 ```bash
-PYTHONPATH=. uvicorn technical_analysis_trainer.prediction_dashboard_api:app --reload --port 8001
+PYTHONPATH=. uvicorn technical_analysis_trainer.apps.api:app --reload --port 8001
 ```
 
 2. Frontend (Vite proxies `/api` to 8001):
@@ -58,7 +58,7 @@ Open `http://localhost:5173`. Use **Refresh** to reload `/api/snapshot`.
 
 ## Docker full stack (postgres + api + web + scheduler)
 
-Runs the dashboard behind nginx on port 80, FastAPI backend, PostgreSQL, and an hourly prediction scheduler (supercronic).
+Runs the dashboard behind nginx on port 80, FastAPI backend, PostgreSQL, an hourly prediction scheduler (supercronic), and the Go trading bot (paper mode by default).
 
 ```bash
 cp deploy/.env.example deploy/.env
@@ -76,6 +76,35 @@ docker compose -f deploy/docker-compose.yml --env-file deploy/.env up --build -d
 
 Stop: `docker compose -f deploy/docker-compose.yml --env-file deploy/.env down`
 
+## Trading bot (Go)
+
+The `trading_bot/` service polls predictions from the API (or PostgreSQL), evaluates a YAML strategy, and executes trades in **paper** or **live** mode.
+
+Config: [`trading_bot/config/strategy.yaml`](trading_bot/config/strategy.yaml) (see [`strategy.example.yaml`](trading_bot/config/strategy.example.yaml)).
+
+| Env var | Purpose |
+|---------|---------|
+| `STRATEGY_CONFIG` | Path to strategy YAML (default `config/strategy.yaml`) |
+| `STATE_PATH` | JSON state file for position + dedupe across restarts (default `/var/lib/trading_bot/state.json`) |
+| `TRADE_LOG_PATH` | Append structured trade logs (JSON lines) |
+| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Required only for `bot.mode: live` |
+
+**SL/TP behavior:**
+- **live** — after market entry, places Binance protective orders (`STOP_LOSS` + `TAKE_PROFIT` on spot; `STOP_MARKET` + `TAKE_PROFIT_MARKET` on futures). Cancels them on manual close. `SyncPosition` detects exchange-side fills.
+- **paper** — checks SL/TP against the last candle close on each cron tick.
+
+Local run (paper, against API on port 8001):
+
+```bash
+cd trading_bot
+STRATEGY_CONFIG=config/strategy.yaml STATE_PATH=/tmp/trading_bot_state.json \
+  go run ./cmd/bot
+```
+
+Tests: `cd trading_bot && go test ./...`
+
+Bot health: `curl http://localhost:8081/health` (exposed in Docker on the internal network).
+
 ## Deploy to AWS EC2
 
 See [deploy/aws/README.md](deploy/aws/README.md) for Terraform (`deploy/aws/terraform/`) or manual bootstrap (`deploy/aws/scripts/bootstrap-ec2.sh`).
@@ -89,7 +118,7 @@ Secrets: [deploy/aws/github-secrets.md](deploy/aws/github-secrets.md). On EC2 us
 
 ## Scheduled predictions (cron + PostgreSQL)
 
-Hourly quantile and trend predictions are persisted to PostgreSQL. The dashboard above stays **live** (on-demand); only the cron job writes to the DB.
+Hourly quantile and trend predictions are persisted to PostgreSQL by the scheduler. The dashboard computes the **current** forecast on demand and overlays **historical** quantile segments from the DB when `DATABASE_URL` is available to the API (Docker stack by default).
 
 ### Setup
 
@@ -118,7 +147,7 @@ export DATABASE_URL=postgresql://tan:tan@localhost:5432/tan_predictions
 
 ```bash
 # Peewee
-PYTHONPATH=. python -c "from technical_analysis_trainer.prediction_store import init_db; init_db()"
+PYTHONPATH=. python -c "from technical_analysis_trainer.storage.prediction_store import init_db; init_db()"
 
 # Or SQL
 psql "$DATABASE_URL" -f technical_analysis_trainer/sql/migrations/001_predictions.sql
@@ -128,19 +157,19 @@ psql "$DATABASE_URL" -f technical_analysis_trainer/sql/migrations/001_prediction
 
 ```bash
 set -a && source .env.predict && set +a
-PYTHONPATH=. python -m technical_analysis_trainer.run_scheduled_prediction
+PYTHONPATH=. python -m technical_analysis_trainer.apps.scheduler
 ```
 
 Exit code `0` prints `scheduled_prediction OK {...}`; non-zero on failure (suitable for cron alerts).
 
-**Requirements:** same ONNX/scaler/CSV paths as the live dashboard (`QUANTILE_MODEL_RUN`, trend `test_config.yaml` `data_path`, `trend_model/models/`).
+**Requirements:** same ONNX/scaler/CSV paths as the live dashboard (`QUANTILE_MODEL_RUN`, `models/trend/test_config.yaml` `data_path`, `models/trend/models/`).
 
 ### Cron (1h candles, UTC)
 
 Run **5 minutes after each hour** so Binance has closed the previous bar:
 
 ```cron
-5 * * * * cd /path/to/tan-model && set -a && . .env.predict && set +a && PYTHONPATH=. /path/to/venv/bin/python -m technical_analysis_trainer.run_scheduled_prediction >> logs/scheduled_predict.log 2>&1
+5 * * * * cd /path/to/tan-model && set -a && . .env.predict && set +a && PYTHONPATH=. /path/to/venv/bin/python -m technical_analysis_trainer.apps.scheduler >> logs/scheduled_predict.log 2>&1
 ```
 
 On macOS you can use `launchd` with the same `ProgramArguments` instead of crontab.

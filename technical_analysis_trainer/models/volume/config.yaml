@@ -1,0 +1,23 @@
+symbol: BTCUSDT
+data_path: technical_analysis_trainer/data/btcusdt_1h_train.csv
+seed: 1337
+epochs: 200
+learning_rate: 0.001
+hidden_size: 32
+num_layers: 1
+weight_decay: 0.0005
+patience: 25
+dropout_lstm: 0.2
+dropout_fc: 0.3
+batch_size: 64
+threshold: 0.003
+horizon: 1
+lr: 0.001
+cv_splits: 5
+n_estimators: 800
+max_depth: 8
+output_dir: technical_analysis_trainer/models/volume/models
+window:
+  short: 1
+  mid: 6
+  long: 24
