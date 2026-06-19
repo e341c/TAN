@@ -1,0 +1,10 @@
+enabled_models:
+  - quantile
+  - trend
+symbol: BTCUSDT
+interval: 1h
+binance_limit: 45
+defaults:
+  quantile_run: "2026-05-08T01-04-55"
+  trend_run: null
+trend_config_path: technical_analysis_trainer/models/trend/test_config.yaml

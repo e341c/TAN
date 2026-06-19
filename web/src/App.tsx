@@ -4,8 +4,16 @@ import {
   ColorType,
   LineSeries,
   createChart,
+  createSeriesMarkers,
 } from "lightweight-charts";
-import type { CandlestickData, IChartApi, UTCTimestamp } from "lightweight-charts";
+import type {
+  CandlestickData,
+  IChartApi,
+  LineData,
+  SeriesMarker,
+  UTCTimestamp,
+  WhitespaceData,
+} from "lightweight-charts";
 import "./App.css";
 
 type Candle = {
@@ -14,6 +22,27 @@ type Candle = {
   high: number;
   low: number;
   close: number;
+};
+
+type QuantileHistoryItem = {
+  candle_time: string;
+  target_time: string;
+  candle_unix: number;
+  target_unix: number;
+  q10: number;
+  q50: number;
+  q90: number;
+  last_close?: number;
+};
+
+type TrendHistoryItem = {
+  candle_time: string;
+  target_time: string;
+  candle_unix: number;
+  target_unix: number;
+  predicted_trend: string;
+  prob_up?: number;
+  prob_down?: number;
 };
 
 type Snapshot = {
@@ -25,6 +54,8 @@ type Snapshot = {
     q90: number;
     log_returns?: number[];
   };
+  quantile_history?: QuantileHistoryItem[];
+  trend_history?: TrendHistoryItem[];
   trend: {
     predicted_trend: string;
     probabilities: Record<string, number>;
@@ -79,6 +110,140 @@ function formatPrice(n: number): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
+}
+
+function withAlpha(color: string, alpha: number): string {
+  if (color.startsWith("#") && color.length === 7) {
+    const r = parseInt(color.slice(1, 3), 16);
+    const g = parseInt(color.slice(3, 5), 16);
+    const b = parseInt(color.slice(5, 7), 16);
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
+  return color;
+}
+
+function filterHistoryForLive(
+  history: QuantileHistoryItem[] | undefined,
+  liveNextTimeIso: string,
+): QuantileHistoryItem[] {
+  if (!history?.length) {
+    return [];
+  }
+  let liveTargetUnix: number;
+  try {
+    liveTargetUnix = parseNextTimeUnix(liveNextTimeIso);
+  } catch {
+    return history;
+  }
+  return history.filter((item) => item.target_unix !== liveTargetUnix);
+}
+
+function filterTrendHistoryForLive(
+  history: TrendHistoryItem[] | undefined,
+  liveNextTimeIso: string,
+): TrendHistoryItem[] {
+  if (!history?.length) {
+    return [];
+  }
+  let liveTargetUnix: number;
+  try {
+    liveTargetUnix = parseNextTimeUnix(liveNextTimeIso);
+  } catch {
+    return history;
+  }
+  return history.filter((item) => item.target_unix !== liveTargetUnix);
+}
+
+function trendProbForItem(item: TrendHistoryItem): number | undefined {
+  const trend = item.predicted_trend.toUpperCase();
+  if (trend === "UP") {
+    return item.prob_up;
+  }
+  if (trend === "DOWN") {
+    return item.prob_down;
+  }
+  return undefined;
+}
+
+function trendMarkerText(
+  predictedTrend: string,
+  prob?: number,
+  probabilities?: Record<string, number>,
+): string {
+  const trend = predictedTrend.toUpperCase();
+  let p = prob;
+  if (p === undefined && probabilities) {
+    p = probabilities[trend] ?? probabilities[trend.toLowerCase()];
+  }
+  if (p !== undefined && Number.isFinite(p)) {
+    return `${trend} ${(p * 100).toFixed(0)}%`;
+  }
+  return trend;
+}
+
+function buildTrendMarkers(
+  history: TrendHistoryItem[],
+  liveTrend: Snapshot["trend"] | undefined,
+  lastT: UTCTimestamp,
+  candleTimes: Set<number>,
+  chartUp: string,
+  chartDown: string,
+): SeriesMarker<UTCTimestamp>[] {
+  const markers: SeriesMarker<UTCTimestamp>[] = [];
+
+  for (const item of history) {
+    if (!candleTimes.has(item.candle_unix)) {
+      continue;
+    }
+    const trend = item.predicted_trend.toUpperCase();
+    if (trend !== "UP" && trend !== "DOWN") {
+      continue;
+    }
+    const isUp = trend === "UP";
+    markers.push({
+      time: item.candle_unix as UTCTimestamp,
+      position: isUp ? "belowBar" : "aboveBar",
+      shape: isUp ? "arrowUp" : "arrowDown",
+      color: withAlpha(isUp ? chartUp : chartDown, 0.45),
+      text: trendMarkerText(trend, trendProbForItem(item)),
+    });
+  }
+
+  if (liveTrend?.predicted_trend) {
+    const trend = liveTrend.predicted_trend.toUpperCase();
+    if (trend === "UP" || trend === "DOWN") {
+      const isUp = trend === "UP";
+      markers.push({
+        time: lastT,
+        position: isUp ? "belowBar" : "aboveBar",
+        shape: isUp ? "arrowUp" : "arrowDown",
+        color: isUp ? chartUp : chartDown,
+        text: trendMarkerText(trend, undefined, liveTrend.probabilities),
+      });
+    }
+  }
+
+  markers.sort((a, b) => (a.time as number) - (b.time as number));
+  return markers;
+}
+
+function buildHistoryLineData(
+  history: QuantileHistoryItem[],
+  pick: (item: QuantileHistoryItem) => number,
+): (LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp>)[] {
+  const data: (LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp>)[] = [];
+  for (let i = 0; i < history.length; i++) {
+    const item = history[i];
+    const candleT = item.candle_unix as UTCTimestamp;
+    const targetT = item.target_unix as UTCTimestamp;
+    const value = pick(item);
+    if (i > 0) {
+      data.push({ time: candleT });
+    }
+    data.push({ time: candleT, value });
+    data.push({ time: targetT, value });
+  }
+  return data;
 }
 
 export default function App() {
@@ -192,6 +357,23 @@ export default function App() {
       }, []);
     candle.setData(rows);
 
+    const candleTimes = new Set(rows.map((r) => r.time as number));
+    const trendHistory = filterTrendHistoryForLive(
+      snapshot.trend_history,
+      snapshot.quantile.next_time,
+    );
+    const trendMarkers = buildTrendMarkers(
+      trendHistory,
+      snapshot.trend,
+      rows[rows.length - 1].time as UTCTimestamp,
+      candleTimes,
+      chartUp,
+      chartDown,
+    );
+    if (trendMarkers.length > 0) {
+      createSeriesMarkers(candle, trendMarkers);
+    }
+
     const lastRow = rows[rows.length - 1];
     const lastT = lastRow.time as UTCTimestamp;
     let nextT: number;
@@ -206,6 +388,39 @@ export default function App() {
     const q10 = snapshot.quantile.q10;
     const q50 = snapshot.quantile.q50;
     const q90 = snapshot.quantile.q90;
+
+    const history = filterHistoryForLive(
+      snapshot.quantile_history,
+      snapshot.quantile.next_time,
+    );
+    if (history.length > 0) {
+      const histQ10 = chart.addSeries(LineSeries, {
+        color: withAlpha(chartQ10, 0.35),
+        lineWidth: 1,
+        lineStyle: 2,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      histQ10.setData(buildHistoryLineData(history, (item) => item.q10));
+
+      const histQ50 = chart.addSeries(LineSeries, {
+        color: withAlpha(chartQ50, 0.35),
+        lineWidth: 1,
+        lineStyle: 2,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      histQ50.setData(buildHistoryLineData(history, (item) => item.q50));
+
+      const histQ90 = chart.addSeries(LineSeries, {
+        color: withAlpha(chartQ90, 0.35),
+        lineWidth: 1,
+        lineStyle: 2,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      histQ90.setData(buildHistoryLineData(history, (item) => item.q90));
+    }
 
     const lineQ10 = chart.addSeries(LineSeries, {
       color: chartQ10,
@@ -326,18 +541,28 @@ export default function App() {
         <div className="legend">
           <span className="chip">
             <i className="dot" style={{ background: "var(--chart-q10)" }} />
-            Quantile q10
+            Quantile q10 (live)
           </span>
           <span className="chip">
             <i className="dot" style={{ background: "var(--chart-q50)" }} />
-            Quantile q50 (median)
+            Quantile q50 (live)
           </span>
           <span className="chip">
             <i className="dot" style={{ background: "var(--chart-q90)" }} />
-            Quantile q90
+            Quantile q90 (live)
           </span>
           <span className="chip chip-muted">
-            Lines span last closed bar → predicted next bar open
+            Faded dashed lines: historical forecasts from DB
+          </span>
+          <span className="chip chip-muted">
+            Solid lines: current forecast (last bar → next open)
+          </span>
+          <span className="chip">
+            <i className="dot" style={{ background: "var(--chart-up)" }} />
+            ▲ UP / ▼ DOWN (live)
+          </span>
+          <span className="chip chip-muted">
+            Faded arrows: historical trend from DB
           </span>
         </div>
 

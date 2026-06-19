@@ -1,0 +1,74 @@
+bot:
+  mode: paper
+  log_level: info
+
+market:
+  type: spot
+  symbol: BTCUSDT
+  interval: 1h
+  margin: false
+  leverage: 1
+  position_side: both
+
+predictions:
+  source: api
+  api_base_url: http://api:8000
+  database_url: ""
+  schedule: "5 * * * *"
+
+strategy:
+  name: trend_quantile_v1
+  entry:
+    long:
+      all:
+        - field: trend.predicted_trend
+          op: eq
+          value: UP
+        - field: trend.probabilities.UP
+          op: gte
+          value: 0.60
+        - field: quantile.spread_pct
+          op: gte
+          value: 0.3
+    short:
+      all:
+        - field: trend.predicted_trend
+          op: eq
+          value: DOWN
+        - field: trend.probabilities.DOWN
+          op: gte
+          value: 0.60
+  exit:
+    long:
+      any:
+        - field: trend.predicted_trend
+          op: eq
+          value: DOWN
+        - field: trend.probabilities.UP
+          op: lt
+          value: 0.45
+    short:
+      any:
+        - field: trend.predicted_trend
+          op: eq
+          value: UP
+
+risk:
+  quote_size_usdt: 100
+  max_open_positions: 1
+  cooldown_minutes: 55
+  # stop_loss / take_profit: prices from quantile bands or fixed_pct
+  # live mode: STOP_LOSS + TAKE_PROFIT orders placed on Binance after entry
+  # paper mode: SL/TP checked each cron tick against last candle close
+  stop_loss:
+    type: quantile_band
+    long_band: q10
+    short_band: q90
+  take_profit:
+    type: quantile_band
+    long_band: q90
+    short_band: q10
+
+exchange:
+  testnet: false
+  recv_window_ms: 5000

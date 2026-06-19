@@ -1,0 +1,12 @@
+symbol: BTCUSDT
+data_path: technical_analysis_trainer/data/btcusdt_1h_train.csv
+epochs: 100
+learning_rate: 0.001
+hidden_size: 64
+horizon: 24
+cv_splits: 5
+output_dir: technical_analysis_trainer/models/quantile/models
+window:
+  short: 1
+  mid: 12
+  long: 24
