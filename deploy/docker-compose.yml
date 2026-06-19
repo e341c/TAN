@@ -11,6 +11,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-tan}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tan}
       POSTGRES_DB: ${POSTGRES_DB:-tan_predictions}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -35,7 +37,7 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL}
-    command: python -c "from technical_analysis_trainer.prediction_store import init_db; init_db()"
+    command: python -c "from technical_analysis_trainer.storage.prediction_store import init_db; init_db()"
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,8 +60,8 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1}
       PYTHONPATH: /app
     volumes:
-      - ../technical_analysis_trainer/quantile_model/models:/app/technical_analysis_trainer/quantile_model/models:ro
-      - ../technical_analysis_trainer/trend_model/models:/app/technical_analysis_trainer/trend_model/models:ro
+      - ../technical_analysis_trainer/models/quantile/models:/app/technical_analysis_trainer/models/quantile/models:ro
+      - ../technical_analysis_trainer/models/trend/models:/app/technical_analysis_trainer/models/trend/models:ro
       - ../technical_analysis_trainer/data:/app/technical_analysis_trainer/data:ro
     depends_on:
       migrate:
@@ -87,6 +89,39 @@ services:
     networks:
       - tan_net
 
+  trading_bot:
+    build:
+      context: ..
+      dockerfile: trading_bot/Dockerfile
+    image: ${TAN_TRADING_BOT_IMAGE:-tan-trading-bot:local}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      STRATEGY_CONFIG: /config/strategy.yaml
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET:-}
+      DATABASE_URL: ${DATABASE_URL}
+      TRADE_LOG_PATH: /var/log/trades.jsonl
+      STATE_PATH: /var/lib/trading_bot/state.json
+    volumes:
+      - ../trading_bot/config/strategy.yaml:/config/strategy.yaml:ro
+      - trading_bot_logs:/var/log
+      - trading_bot_state:/var/lib/trading_bot
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - tan_net
+
   scheduler:
     build:
       context: ..
@@ -105,8 +140,8 @@ services:
       PREDICTION_BINANCE_LIMIT: ${PREDICTION_BINANCE_LIMIT:-45}
       PYTHONPATH: /app
     volumes:
-      - ../technical_analysis_trainer/quantile_model/models:/app/technical_analysis_trainer/quantile_model/models:ro
-      - ../technical_analysis_trainer/trend_model/models:/app/technical_analysis_trainer/trend_model/models:ro
+      - ../technical_analysis_trainer/models/quantile/models:/app/technical_analysis_trainer/models/quantile/models:ro
+      - ../technical_analysis_trainer/models/trend/models:/app/technical_analysis_trainer/models/trend/models:ro
       - ../technical_analysis_trainer/data:/app/technical_analysis_trainer/data:ro
       - scheduler_logs:/var/log
     command: ["/usr/local/bin/supercronic", "/etc/crontab"]
@@ -121,6 +156,8 @@ services:
 volumes:
   pgdata:
   scheduler_logs:
+  trading_bot_logs:
+  trading_bot_state:
 
 networks:
   tan_net:

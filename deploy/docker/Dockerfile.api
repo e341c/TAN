@@ -21,4 +21,4 @@ RUN touch /var/log/scheduled_predict.log
 ENV PYTHONPATH=/app
 EXPOSE 8000
 
-CMD ["uvicorn", "technical_analysis_trainer.prediction_dashboard_api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "technical_analysis_trainer.apps.api:app", "--host", "0.0.0.0", "--port", "8000"]
