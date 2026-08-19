@@ -1,0 +1,43 @@
+# Конфиг исторического бэктеста trend-модели.
+#   PYTHONPATH=. python -m technical_analysis_trainer.apps.backtest
+# Любой ключ можно перебить флагом CLI (см. --help), путь к конфигу — через
+# --config или переменную окружения CONFIG_PATH.
+
+# Какой прогон модели тестируем.
+# null → берётся тот же run, что отдаёт production: TREND_MODEL_RUN, иначе
+# defaults.trend_run из assembly/config.yaml. То есть по умолчанию бэктест
+# проверяет ровно то, что крутится в вебе.
+trend_run: null
+
+symbol: BTCUSDT
+interval: 1h
+
+data:
+  # Свечи берём из локальных CSV — офлайн и вся история сразу.
+  btc: technical_analysis_trainer/data/train/btcusdt_1h.csv
+  # mtf / cross_market читаются ИЗ ЭТОГО конфига, чтобы набор фич совпал с
+  # обучением. Подменять на test_config.yaml не нужно: там те же блоки, но
+  # пути ведут на укороченные predict-CSV.
+  trend_config: technical_analysis_trainer/models/trend/config.yaml
+
+range:
+  # Сколько последних свечей взять. start/end, если заданы, имеют приоритет.
+  last_bars: 500
+  # ISO-дата или дата-время в UTC, например 2026-01-01 или 2026-01-01T00:00:00.
+  # start: null и end: null вместе с last_bars: null → вся история.
+  start: null
+  end: null
+  # 1 = предсказание на каждой свече. Больше — прореживает и линии, и метрики.
+  stride: 1
+
+chart:
+  out: artifacts/backtest.html
+  # false → только записать файл, не открывать браузер (то же, что --no-open).
+  open: true
+  template: plotly_dark
+  # Предохранитель: метрики считаются по всему диапазону, а на график попадают
+  # только последние max_lines якорей — 5000 линий браузер не переживёт.
+  max_lines: 750
+  # Рисовать ли якоря, у которых барьер так и не был задет за max_holding.
+  # В метриках точности они не участвуют в любом случае (как и при обучении).
+  show_unresolved: true

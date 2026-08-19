@@ -115,6 +115,61 @@ def fetch_data(symbol: str, interval: str, months: int, output_dir: str, with_fu
     print(f"✅ Saved {output_path} ({len(df)} rows)")
 
 
+def check_freshness(
+    output_dir: str,
+    symbols: list[str],
+    interval: str = "1h",
+    max_age_days: int = 2,
+    min_rows: int = 20000,
+) -> int:
+    """
+    Report stale or short training files. Returns the number of problems.
+
+    Two separate failures worth catching, both of which have bitten this repo:
+
+      * **stale** — training data ending months before serving time means the
+        model is fitted to a different volatility regime than the one it runs in;
+      * **short** — a benchmark with far less history than the main symbol makes
+        its cross-market features forward-filled constants during training and
+        real values at inference, which is silent train/serve skew.
+    """
+    import pandas as pd
+
+    problems = 0
+    lengths: dict[str, int] = {}
+    for sym in symbols:
+        path = os.path.join(output_dir, f"{sym.lower()}_{interval}.csv")
+        if not os.path.isfile(path):
+            print(f"MISSING  {path}")
+            problems += 1
+            continue
+        df = pd.read_csv(path)
+        last = pd.to_datetime(df["ts"], utc=True).max()
+        age = (pd.Timestamp.now(tz="UTC") - last).days
+        lengths[sym] = len(df)
+        flags = []
+        if age > max_age_days:
+            flags.append(f"STALE({age}d)")
+        if len(df) < min_rows:
+            flags.append(f"SHORT({len(df)} rows)")
+        status = " ".join(flags) if flags else "ok"
+        print(f"{status:22} {os.path.basename(path):22} rows={len(df):6} last={last.date()}")
+        if flags:
+            problems += 1
+
+    # A benchmark much shorter than the main symbol is the skew case above.
+    if len(lengths) > 1:
+        longest = max(lengths.values())
+        for sym, n in lengths.items():
+            if n < longest * 0.5:
+                print(
+                    f"⚠ {sym} has {n} rows vs {longest} for the longest series — its "
+                    "cross-market features will be forward-filled for most of training."
+                )
+                problems += 1
+    return problems
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch historical data from Binance.")
     parser.add_argument("--symbol", type=str, default="BTCUSDT")
@@ -123,7 +178,17 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="./data")
     parser.add_argument("--no-funding", action="store_true")
     parser.add_argument("--also", nargs="*", default=[], metavar="SYMBOL")
+    parser.add_argument("--check", action="store_true", help="report staleness, do not fetch")
+    parser.add_argument("--max-age-days", type=int, default=2)
     args = parser.parse_args()
+
+    if args.check:
+        n = check_freshness(
+            args.output, [args.symbol, *args.also], args.interval, args.max_age_days
+        )
+        print(f"\n{n} problem(s)")
+        raise SystemExit(1 if n else 0)
+
     fetch_data(args.symbol, args.interval, args.months, args.output, with_funding=not args.no_funding)
     for extra in args.also:
         fetch_data(extra, args.interval, args.months, args.output, with_funding=False)

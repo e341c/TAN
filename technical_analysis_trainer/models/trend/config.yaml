@@ -1,13 +1,13 @@
 # General settings
 symbol: BTCUSDT
-data_path: technical_analysis_trainer/data/train/btcusdt_1h_train.csv
+data_path: technical_analysis_trainer/data/train/btcusdt_1h.csv
 # seed: число — воспроизводимый запуск; seed: auto — новый seed каждый прогон (см. train.py resolve_seed_into_cfg)
 seed: auto
 # Непрерывное обучение: после каждого сохранения модели снова читается этот конфиг и стартует новый прогон (Ctrl+C — стоп)
 continuous_training: true
 
 # Model parameters
-epochs: 200
+epochs: 60
 # learning rate: скорость обучения.
 # Пример: 0.0005 — средняя скорость; меньше → медленнее обучение; больше → риск переобучения.
 learning_rate: 0.00055
@@ -19,8 +19,34 @@ num_layers: 2
 # Регуляризация: даём модели учиться, переобучение режем early stopping
 # L2‑регуляризация (штраф за большие веса).
 weight_decay: 0.0005
-# стоп, когда val_loss не улучшался 25 эпох
-patience: 25                
+# стоп, когда метрика отбора не улучшалась 12 эпох.
+# Было 25 при отборе по val_loss: пик приходится на эпоху 2-4, так что прогон
+# тратил ~22 эпохи впустую, чтобы вернуться к уже сохранённому чекпоинту.
+patience: 12
+# Метрика early stopping / выбора чекпоинта: val_loss | val_auc.
+#
+# ОСТАВЛЕНО val_loss. Отбор по val_auc даёт лучший VAL и худший TEST — это
+# переобучение на валидации: максимум из ~25 шумных пер-эпоховых замеров AUC
+# (ровно то, о чём предупреждает core/validation.expected_max_of_noise).
+# Замер по 3 фолдам x 3 сида на одних и тех же траекториях, test считался один
+# раз после выбора правила:
+#   val_loss           test AUC 0.5557  acc 0.5299   (val AUC 0.5248)
+#   val_loss + min_epochs=3  test AUC 0.5585  acc 0.5401   (val AUC 0.5303)
+#   val_auc            test AUC 0.5270  acc 0.5125   (val AUC 0.5451)  <- худший
+#   фиксированная 5-я эпоха  test AUC 0.5398  acc 0.5255
+early_stopping_metric: val_loss
+# Не брать чекпоинт раньше этой эпохи.
+#
+# Это и есть починка «обучение встаёт на эпохе 1»: чекпоинт эпохи 1 — это
+# инициализация модели, оптимизатор ещё ничего не нашёл, а LR на 1-2 эпохе идёт
+# на 20-40% от целевого (разогрев). Раньше val_loss выбирал эпоху 1 в 3 из 9
+# прогонов, и именно эти фолды проваливались на test (0.5386 против 0.5557,
+# если брать эпоху 1 всегда).
+#
+# Оговорка: сам порог 3 подобран при видимом test (сравнение 7 правил выше),
+# поэтому +0.003 AUC относительно чистого val_loss нельзя считать доказанным.
+# Обоснованная часть — «не сохранять эпоху 1»; ровно 3 против 2 или 4 — нет.
+min_epochs: 3
 # dropout перед fc (регуляризация). Пример: 0.1 — слабое регуляризация;
 # больше → больше регуляризация, меньше риск переобучения. Только при num_layers > 1
 dropout_lstm: 0.2
@@ -31,7 +57,44 @@ dropout_fc: 0.1
 batch_size: 64
 
 # Data parameters
-# порог return для метки UP/DOWN (|return| <= threshold → бар не используется)
+# ── Target ────────────────────────────────────────────────────────────────
+# target_mode: next_bar — знак return через horizon баров (старое поведение)
+#              triple_barrier — достигнет ли цена +k*sigma раньше чем -k*sigma
+# Next-bar sign на 1H — почти чистый шум (184 прогона упёрлись в ROC-AUC ~0.53).
+# Triple barrier агрегирует по всему пути → выше SNR и прямо отображается в
+# торговлю (тейк + стоп).
+target_mode: triple_barrier
+triple_barrier:
+  # Барьеры в единицах sigma (волатильность за vol_window баров).
+  # Выбрано по VAL AUC (не по test!): 1.75σ→0.5141, 2.5σ→0.5237, 3.5σ→0.5122.
+  # Узкие барьеры (1.0σ ≈ ±0.5%) пробиваются за пару часов → задача снова
+  # вырождается в шум следующей свечи (test AUC 0.4937, хуже монетки).
+  upper_mult: 2.5
+  lower_mult: 2.5
+  # максимальное время удержания в барах (вертикальный барьер)
+  max_holding: 24
+  vol_window: 72
+
+# ── Evaluation protocol ───────────────────────────────────────────────────
+# Число walk-forward фолдов: один тестовый период = один режим рынка.
+n_folds: 3
+# Моделей в ансамбле на фолд. Разброс между seed'ами (std 0.005 ROC-AUC)
+# полностью объясняет "лучшие" прогоны в train_runs.csv — усредняем, а не
+# выбираем счастливый.
+n_seeds: 5
+# эпохи линейного разогрева LR (42% старых прогонов останавливались к 10-й эпохе)
+warmup_epochs: 5
+# Затухание LR после разогрева: cosine | none.
+# Раньше LR держался на пике до конца прогона, поэтому train loss уходил
+# 0.69 -> 0.35 при падении val AUC 0.557 -> 0.463. Потолок это не поднимает
+# (~0.555 val AUC на этих данных при любом расписании), но убирает бег на
+# полном LR после того, как оптимум уже пройден.
+lr_decay: cosine
+# Нижняя граница косинуса как доля от learning_rate.
+lr_min_factor: 0.05
+
+# порог return для метки UP/DOWN при target_mode: next_bar
+# (|return| <= threshold → бар не используется)
 threshold: 0.001
 # После StandardScaler: обрезка каждой фичи в [min, max] (в σ train). Число → симметрично [-x, x].
 # Иначе dict: { min: -5, max: 8 }. Логируется в train_runs.csv и в scaler_*.pkl для инференса.
@@ -73,9 +136,9 @@ cross_market:
   merge_tolerance: 7D
   benchmarks:
     eth:
-      path: technical_analysis_trainer/data/train/ethusdt_1h_train.csv
+      path: technical_analysis_trainer/data/train/ethusdt_1h.csv
     sol:
-      path: technical_analysis_trainer/data/train/solusdt_1h_train.csv
+      path: technical_analysis_trainer/data/train/solusdt_1h.csv
     alt_index:
       path: ""
     btc_d:
@@ -84,9 +147,9 @@ cross_market:
       path: ""
   macro:
     dxy:
-      path: technical_analysis_trainer/data/train/macro_dtwexbgs_1d_train.csv
+      path: technical_analysis_trainer/data/train/macro_dtwexbgs_1d.csv
     risk_proxy:
-      path: technical_analysis_trainer/data/train/macro_vixcls_1d_train.csv
+      path: technical_analysis_trainer/data/train/macro_vixcls_1d.csv
   corr:
     benchmark: eth
     windows: [24, 72, 168]

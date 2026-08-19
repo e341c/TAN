@@ -11,15 +11,24 @@ import pandas as pd
 
 from technical_analysis_trainer.core.artifacts import ArtifactStore, resolve_path
 from technical_analysis_trainer.core.dataset import load_dataset
+from technical_analysis_trainer.core.validation import dead_features
 from technical_analysis_trainer.models.trend.features import (
     add_features,
     attach_cross_market_features,
     attach_mtf_features,
 )
+from technical_analysis_trainer.models.trend.target import default_spec, spec_from_bundle
 from technical_analysis_trainer.runtime.binance import fetch_last_candles_sync
 
 TAIL_ROWS = int(os.environ.get("REALTIME_CSV_TAIL", "1000"))
-BINANCE_LIMIT = int(os.environ.get("REALTIME_BINANCE_LIMIT", "400"))
+# 1000 is Binance's per-request maximum and is deliberately taken in full. The
+# CSVs under data/predict/ are not on any refresh schedule (only the macro feeds
+# are, see deploy/docker/crontab), so everything after their last row comes from
+# this fetch. Feature warm-up now runs ~336 bars (168-bar rolling level + its
+# 168-bar de-trending reference) before the 24-bar window; at the previous 400
+# the reference window reached back across the CSV/live seam into months-old
+# rows and normalised today's flow against them.
+BINANCE_LIMIT = int(os.environ.get("REALTIME_BINANCE_LIMIT", "1000"))
 
 
 def _ensure_schema_for_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -100,22 +109,33 @@ def _deep_cross_cfg_with_paths(cross_cfg: dict | None, path_overrides: dict[str,
     return out
 
 
+def load_target_spec(store: ArtifactStore, run_id: str | None = None) -> dict[str, Any]:
+    """Read a run's target semantics from its saved bundle."""
+    import pickle
+
+    try:
+        run = store.get_run(run_id)
+        with open(run.scaler_path, "rb") as f:
+            return spec_from_bundle(pickle.load(f))
+    except Exception:  # noqa: BLE001 - a missing spec must not break inference
+        return default_spec()
+
+
 def build_trend_x_window(
     cfg: dict[str, Any],
     store: ArtifactStore,
     run_id: str | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    """Live path: fetch current candles from Binance, stitch onto the CSV tail."""
     cross_cfg = cfg.get("cross_market")
-    mtf_cfg = cfg.get("mtf")
 
     btc_live = fetch_last_candles_sync(str(cfg.get("symbol", "BTCUSDT")), "1h", BINANCE_LIMIT)
     eth_live = fetch_last_candles_sync("ETHUSDT", "1h", BINANCE_LIMIT)
     sol_live = fetch_last_candles_sync("SOLUSDT", "1h", BINANCE_LIMIT)
 
     btc_merged = _overlay_csv_tail_with_live(str(cfg["data_path"]), btc_live, TAIL_ROWS)
-    path_overrides: dict[str, str] = {}
-    temp_paths: list[str] = []
 
+    eth_merged = sol_merged = None
     if (cross_cfg or {}).get("enabled", False):
         bench = (cross_cfg or {}).get("benchmarks") or {}
         eth_entry = bench.get("eth") or {}
@@ -124,16 +144,57 @@ def build_trend_x_window(
         sol_csv = (sol_entry.get("path") if isinstance(sol_entry, dict) else None) or ""
         if eth_csv.strip():
             eth_merged = _overlay_csv_tail_with_live(eth_csv, eth_live, TAIL_ROWS)
-            p = _write_temp_csv(eth_merged)
-            temp_paths.append(p)
-            path_overrides["eth"] = p
         if sol_csv.strip():
             sol_merged = _overlay_csv_tail_with_live(sol_csv, sol_live, TAIL_ROWS)
-            p = _write_temp_csv(sol_merged)
+
+    # Live frames end on the still-forming candle, so the window must stop one
+    # bar earlier to stay on closed data.
+    return build_trend_x_window_from_frames(
+        cfg, store, run_id=run_id, btc=btc_merged, eth=eth_merged, sol=sol_merged,
+        last_row_is_closed=False,
+    )
+
+
+def build_trend_x_window_from_frames(
+    cfg: dict[str, Any],
+    store: ArtifactStore,
+    run_id: str | None = None,
+    *,
+    btc: pd.DataFrame,
+    eth: pd.DataFrame | None = None,
+    sol: pd.DataFrame | None = None,
+    last_row_is_closed: bool = True,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Build the model window from explicitly supplied frames — no network calls.
+
+    `last_row_is_closed` selects the anchor:
+
+      * False (live): the final row is the forming candle, so the window ends on
+        the row before it.
+      * True (backfill): the caller trimmed the frames so the final row IS the
+        closed bar being predicted from, and it belongs in the window.
+
+    Both produce the same window *content* for the same anchor bar, which is what
+    makes a backfilled prediction comparable to the live one it stands in for.
+    """
+    cross_cfg = cfg.get("cross_market")
+    mtf_cfg = cfg.get("mtf")
+
+    path_overrides: dict[str, str] = {}
+    temp_paths: list[str] = []
+
+    if (cross_cfg or {}).get("enabled", False):
+        if eth is not None and len(eth):
+            p = _write_temp_csv(eth)
+            temp_paths.append(p)
+            path_overrides["eth"] = p
+        if sol is not None and len(sol):
+            p = _write_temp_csv(sol)
             temp_paths.append(p)
             path_overrides["sol"] = p
 
-    btc_temp = _write_temp_csv(btc_merged)
+    btc_temp = _write_temp_csv(btc)
     temp_paths.append(btc_temp)
     cross_eff = _deep_cross_cfg_with_paths(cross_cfg, path_overrides)
 
@@ -182,17 +243,32 @@ def build_trend_x_window(
             scale_hi,
         ).astype(np.float32)
 
-        i = len(X_scaled) - 1
+        # A feature that was constant while the scaler was fitted has scale_ = 1.0,
+        # so `transform` leaves its live value essentially raw — the model would be
+        # handed a number it never saw during training (a correlation of 0.9 where
+        # it only ever saw 0.0). Pin those columns to the training constant, which
+        # is what the model was actually fitted against.
+        dead = dead_features(scaler, features)
+        if dead:
+            X_scaled[:, [features.index(f) for f in dead]] = 0.0
+
+        # `i` is one past the last bar that belongs in the window, matching the
+        # training convention (window = X_raw[i - seq_len : i]).
+        i = len(X_scaled) if last_row_is_closed else len(X_scaled) - 1
         if i < seq_len:
             raise ValueError(f"Not enough rows for window: i={i}, seq_len={seq_len}")
 
         x_input = X_scaled[i - seq_len : i].reshape(seq_len, len(features))
+        anchor_idx = i - 1  # last bar actually inside the window
         meta = {
             "trend_run_id": run.run_id,
             "onnx_path": str(run.onnx_path),
             "seq_len": seq_len,
             "n_features": len(features),
-            "last_ts": df_feat["ts"].iloc[i] if "ts" in df_feat.columns else None,
+            "last_ts": df_feat["ts"].iloc[anchor_idx] if "ts" in df_feat.columns else None,
+            # Taken from the artifact, not from cfg: the deployed model defines
+            # what its own output means.
+            "target_spec": load_target_spec(store, run.run_id),
         }
         return x_input, meta
     finally:
@@ -209,7 +285,11 @@ def softmax_np(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     return e / np.sum(e)
 
 
-def run_trend_onnx(X_window: np.ndarray, onnx_path: str) -> dict[str, Any]:
+def run_trend_onnx(
+    X_window: np.ndarray,
+    onnx_path: str,
+    target_spec: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not os.path.isfile(onnx_path):
         raise FileNotFoundError(onnx_path)
     ort_session = ort.InferenceSession(onnx_path)
@@ -220,9 +300,14 @@ def run_trend_onnx(X_window: np.ndarray, onnx_path: str) -> dict[str, Any]:
     class_names = ["DOWN", "UP"] if len(probs) == 2 else [f"C{i}" for i in range(len(probs))]
     pred_i = int(np.argmax(probs))
     display = {class_names[i]: f"{probs[i] * 100:.2f}%" for i in range(len(probs))}
+    spec = target_spec or default_spec()
     return {
         "predicted_trend": class_names[pred_i],
         "probabilities": {class_names[i]: float(probs[i]) for i in range(len(probs))},
         "logits": logits.tolist(),
+        # What this label actually means. Consumers must read this rather than
+        # assuming a 1-bar horizon — the same "UP"/"DOWN" covers both targets.
+        "target": spec,
+        "horizon_hours": spec.get("horizon_hours"),
         **display,
     }

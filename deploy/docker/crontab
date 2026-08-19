@@ -1,2 +1,15 @@
 # UTC — 5 min after each hour (closed 1h candle on Binance)
 5 * * * * cd /app && PYTHONPATH=/app python -m technical_analysis_trainer.apps.scheduler >> /var/log/scheduled_predict.log 2>&1
+
+# Macro (DXY / VIX) once a day at 06:20 UTC, after FRED's morning publication.
+#
+# These feed xmkt_log_ret_dxy and xmkt_log_ret_risk_proxy. A stale file does not
+# error — attach_cross_market_features forward-fills the last value, so the
+# feature silently flattens to a constant and the model is served an input it
+# never saw in training. Left unrefreshed for four months, this is exactly how
+# two of the 54 features went dead in production.
+20 6 * * * cd /app && PYTHONPATH=/app python -m technical_analysis_trainer.data_fetch.macro_fred >> /var/log/macro_fetch.log 2>&1
+
+# Report staleness hourly so a broken feed is visible in the log rather than
+# silently degrading predictions.
+25 * * * * cd /app && PYTHONPATH=/app python -m technical_analysis_trainer.data_fetch.macro_fred --check >> /var/log/macro_fetch.log 2>&1

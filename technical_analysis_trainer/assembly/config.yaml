@@ -3,8 +3,19 @@ enabled_models:
   - trend
 symbol: BTCUSDT
 interval: 1h
-binance_limit: 45
+# Must cover the longest feature warm-up (168-bar HAR-RV window + seq_len).
+# The retired 7-feature model ran on 45; the current one yields zero usable rows
+# at that size, which surfaces as "0 usable bars after feature warm-up".
+binance_limit: 400
 defaults:
-  quantile_run: "2026-05-08T01-04-55"
-  trend_run: null
+  # Precedence: QUANTILE_MODEL_RUN / TREND_MODEL_RUN env > these > plugin default.
+  # Runs before 2026-08-14 use the retired 7-feature raw-price pipeline and will
+  # fail with "X has 21 features, but StandardScaler is expecting 7".
+  quantile_run: "2026-08-17T09-39-47"
+  # Trend runs before 2026-08-17T10-40-50 have 54 features and fail with
+  # "X has 52 features, but StandardScaler is expecting 54": they include the two
+  # raw mtf_*_vwap_* price levels that were dropped for being non-stationary.
+  # Pinned explicitly: left null, the trend plugin serves whichever run has the
+  # newest scaler file, so any training run silently changes production.
+  trend_run: "2026-08-17T15-47-17"
 trend_config_path: technical_analysis_trainer/models/trend/test_config.yaml

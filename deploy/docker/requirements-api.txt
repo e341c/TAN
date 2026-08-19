@@ -28,6 +28,10 @@ onnx==1.20.1
 onnxruntime==1.23.2
 packaging==26.0
 pandas==2.3.3
+# needed by data_fetch.macro_fred (DXY/VIX cron); a missing
+# dependency here silently kills the refresh and the macro
+# features flatten to constants.
+pandas_datareader==0.10.0
 peewee==4.0.1
 propcache==0.4.1
 protobuf==6.33.4

@@ -46,8 +46,18 @@ def mtf_resample_rule(tf_key: str) -> str:
     raise ValueError(f"Unknown MTF key: {tf_key!r}")
 
 
-def collect_mtf_column_names(mtf_cfg: dict | None) -> list[str]:
-    """Stable feature names for scaler / ONNX export."""
+def collect_mtf_column_names(mtf_cfg: dict | None, *, model_inputs_only: bool = False) -> list[str]:
+    """
+    Stable MTF column names for scaler / ONNX export.
+
+    `model_inputs_only=True` drops `mtf_*_vwap_*`. That column is a raw VWAP
+    *price*, kept because `attach_mtf_features` needs it to derive
+    `dist_vwap = close / vwap - 1`, but it must never reach the model: a price
+    level rises without bound, so against a scaler frozen at training time its
+    z-score only ever grows, dragging the output one way until every prediction
+    is the same class. `dist_vwap` carries the same information in stationary
+    form and stays in the feature set.
+    """
     cfg = resolve_mtf_cfg(mtf_cfg)
     if not cfg.get("enabled", True):
         return []
@@ -63,10 +73,11 @@ def collect_mtf_column_names(mtf_cfg: dict | None) -> list[str]:
                 f"{prefix}_rsi_{rsi_p}",
                 f"{prefix}_ret_{ret_w}",
                 f"{prefix}_rv_{rv_w}",
-                f"{prefix}_vwap_{vw_w}",
-                f"{prefix}_dist_vwap_{vw_w}",
             ]
         )
+        if not model_inputs_only:
+            cols.append(f"{prefix}_vwap_{vw_w}")
+        cols.append(f"{prefix}_dist_vwap_{vw_w}")
     return cols
 
 
@@ -447,7 +458,9 @@ def build_features_df(
         df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
 
     mtf_feature_list = [
-        c for c in collect_mtf_column_names(resolved_mtf) if c in df.columns
+        c
+        for c in collect_mtf_column_names(resolved_mtf, model_inputs_only=True)
+        if c in df.columns
     ]
     cross_feature_list = [
         c for c in collect_cross_market_feature_names(cross_market_cfg) if c in df.columns
@@ -529,6 +542,38 @@ def build_features_df(
     # ── Liquidity / flow-shape features (rolling 24/72/168 on 1H) ───────────
     eps = 1e-12
     flow_windows = (24, 72, 168)
+    # Reference window for de-trending the level features below. See
+    # `_detrend`: 168 bars (7 days) is chosen so total warm-up (window + 168)
+    # stays at ~336 bars, which the 1D MTF features already require — the fix
+    # costs no extra history at inference.
+    flow_norm_window = 168
+
+    def _detrend(level: pd.Series) -> pd.Series:
+        """
+        Turn an absolute level into a z-score against its own recent history.
+
+        Amihud illiquidity, range-per-volume and average trade size are all
+        *absolute* quantities: they carry the dollar price, the base-unit volume
+        and the trade count of the moment, none of which are comparable across
+        regimes. Their raw level therefore trends with the market rather than
+        oscillating, and a StandardScaler frozen at training time cannot follow
+        it — the z-scores keep marching in one direction long after the fit.
+
+        This is not hypothetical. In the trend run served in Aug 2026 these nine
+        features had drifted 1.3-1.9 training sd by the end of the model's own
+        test fold, which biased p(UP) from 0.502 on train to 0.544 on test and
+        left argmax picking UP on 95% of test bars and 100% of live ones. The
+        model had not stopped discriminating (ROC-AUC 0.527); its operating
+        point had walked off the data.
+
+        A rolling z-score is stationary by construction, so the same drift can
+        no longer accumulate, and it keeps the part that actually carries signal
+        — how illiquid/large flow is *relative to the recent regime*, which is
+        the same normalisation `vol_z_{w}` already applies to volume.
+        """
+        ref_mean = level.rolling(window=flow_norm_window, min_periods=flow_norm_window).mean()
+        ref_std = level.rolling(window=flow_norm_window, min_periods=flow_norm_window).std()
+        return (level - ref_mean) / (ref_std + eps)
 
     # volume z-score vs its own distribution
     for w in flow_windows:
@@ -540,12 +585,12 @@ def build_features_df(
     abs_lr = df["log_return"].abs()
     amihud_1 = abs_lr / (df["volume"] + eps)
     for w in flow_windows:
-        df[f"amihud_{w}"] = amihud_1.rolling(window=w, min_periods=w).mean()
+        df[f"amihud_{w}"] = _detrend(amihud_1.rolling(window=w, min_periods=w).mean())
 
     # Range per volume: (high-low)/volume (then rolled)
     rpv_1 = (df["high"] - df["low"]) / (df["volume"] + eps)
     for w in flow_windows:
-        df[f"range_per_vol_{w}"] = rpv_1.rolling(window=w, min_periods=w).mean()
+        df[f"range_per_vol_{w}"] = _detrend(rpv_1.rolling(window=w, min_periods=w).mean())
 
     # Avg trade size: volume / trades (then rolled) if trades exist
     has_trades = "trades" in df.columns
@@ -553,7 +598,9 @@ def build_features_df(
         trades = df["trades"].astype(float)
         avg_trade_1 = df["volume"] / (trades + eps)
         for w in flow_windows:
-            df[f"avg_trade_size_{w}"] = avg_trade_1.rolling(window=w, min_periods=w).mean()
+            df[f"avg_trade_size_{w}"] = _detrend(
+                avg_trade_1.rolling(window=w, min_periods=w).mean()
+            )
         trade_features = [f"avg_trade_size_{w}" for w in flow_windows]
     else:
         trade_features = []
@@ -646,6 +693,100 @@ def resolve_feature_scale_clip(cfg: dict | None) -> tuple[float, float]:
     return (-v, v)
 
 
+def triple_barrier_labels(
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    sigma: np.ndarray,
+    upper_mult: float = 1.5,
+    lower_mult: float = 1.5,
+    max_holding: int = 24,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Triple-barrier labelling (López de Prado): does price touch +k*sigma before
+    -k*sigma within `max_holding` bars?
+
+    Why this beats next-bar sign: a single bar's close is almost pure noise, and
+    the trend run log shows 184 attempts topping out at ~0.53 ROC-AUC because of
+    it. A barrier label aggregates over a whole path, so the signal-to-noise is
+    far better, and it maps directly onto how the prediction would be traded
+    (a target and a stop) instead of onto an unusable one-bar sign.
+
+    Barriers are volatility-scaled, so a "move" means the same thing in calm and
+    violent regimes.
+
+    Returns (labels, spans, realized):
+      labels  1 = upper hit first, 0 = lower hit first, -1 = unusable
+      spans   bars until the touch (or max_holding)
+      realized log return over the label's span
+    """
+    n = len(close)
+    labels = np.full(n, -1, dtype=np.int64)
+    spans = np.zeros(n, dtype=np.int64)
+    realized = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        s = sigma[i]
+        if not np.isfinite(s) or s <= 0:
+            continue
+        end = min(i + max_holding, n - 1)
+        if end <= i:
+            break
+
+        up = close[i] * np.exp(upper_mult * s)
+        dn = close[i] * np.exp(-lower_mult * s)
+
+        lab, touch = -1, end
+        for j in range(i + 1, end + 1):
+            hit_up = high[j] >= up
+            hit_dn = low[j] <= dn
+            if hit_up and hit_dn:
+                # Both barriers touched inside the same bar — OHLC cannot say
+                # which came first. Labelling it either way injects a directional
+                # bias, so the sample is dropped.
+                lab, touch = -1, j
+                break
+            if hit_up:
+                lab, touch = 1, j
+                break
+            if hit_dn:
+                lab, touch = 0, j
+                break
+
+        labels[i] = lab
+        spans[i] = touch - i
+        realized[i] = np.log(close[touch] / close[i])
+
+    return labels, spans, realized
+
+
+def average_uniqueness(spans: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """
+    Per-label average uniqueness (López de Prado).
+
+    Triple-barrier labels overlap heavily — a 24-bar span means ~24 consecutive
+    labels share most of their outcome. Treating them as independent inflates
+    the effective sample size and makes every significance test too optimistic.
+    Down-weighting by uniqueness corrects for that.
+    """
+    n = len(spans)
+    concurrency = np.zeros(n + 1, dtype=np.float64)
+    for i in range(n):
+        if not valid[i]:
+            continue
+        concurrency[i : min(i + max(spans[i], 1), n)] += 1.0
+
+    uniq = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        if not valid[i]:
+            continue
+        end = min(i + max(spans[i], 1), n)
+        c = concurrency[i:end]
+        c = np.where(c > 0, c, 1.0)
+        uniq[i] = float(np.mean(1.0 / c))
+    return uniq
+
+
 def add_features(
     df: pd.DataFrame,
     seq_len: int = 30,
@@ -657,9 +798,10 @@ def add_features(
     return_df_feat: bool = False,
     clip_low: float = -5.0,
     clip_high: float = 5.0,
-) -> tuple[np.ndarray, np.ndarray, list[str], StandardScaler] | tuple[
-    np.ndarray, np.ndarray, list[str], StandardScaler, pd.DataFrame
-]:
+    target_mode: str = "next_bar",
+    tb_cfg: dict | None = None,
+    return_weights: bool = False,
+):
     """
     Feature engineering pipeline for OHLCV time series (BTCUSDT 1H).
 
@@ -693,6 +835,41 @@ def add_features(
     # ── Target ───────────────────────────────────────────────────────────────
     future_return = (df_feat["close"].shift(-horizon) - df_feat["close"]) / df_feat["close"]
 
+    n_rows = len(df_feat)
+    if target_mode == "triple_barrier":
+        tb = tb_cfg or {}
+        vol_window = int(tb.get("vol_window", 72))
+        max_holding = int(tb.get("max_holding", 24))
+        lr = np.log(
+            df_feat["close"].astype(float) / df_feat["close"].astype(float).shift(1)
+        )
+        sigma = lr.rolling(vol_window, min_periods=vol_window).std().to_numpy()
+        labels, spans, realized = triple_barrier_labels(
+            df_feat["close"].to_numpy(dtype=np.float64),
+            df_feat["high"].to_numpy(dtype=np.float64),
+            df_feat["low"].to_numpy(dtype=np.float64),
+            sigma,
+            upper_mult=float(tb.get("upper_mult", 1.5)),
+            lower_mult=float(tb.get("lower_mult", 1.5)),
+            max_holding=max_holding,
+        )
+        valid_label = labels >= 0
+        uniq = average_uniqueness(spans, valid_label)
+        # Weight = how much the label is worth (realised move) x how much new
+        # information it carries (uniqueness among overlapping labels).
+        raw_w = np.abs(realized) * uniq
+        label_end = np.arange(n_rows) + np.maximum(spans, 1)
+    else:
+        labels = np.where(
+            future_return.to_numpy() > threshold,
+            1,
+            np.where(future_return.to_numpy() < -threshold, 0, -1),
+        )
+        valid_label = np.abs(future_return.to_numpy()) > threshold
+        # A 0.02% bar and a 2% bar are not equally informative; weight by size.
+        raw_w = np.abs(future_return.to_numpy())
+        label_end = np.arange(n_rows) + horizon
+
     # ── Масштабирование ───────────────────────────────────────────────────────
     X_raw = df_feat[features].values
 
@@ -705,11 +882,12 @@ def add_features(
     X_raw = np.clip(X_raw, clip_low, clip_high)
 
     # ── Построение последовательностей ───────────────────────────────────────
-    X, Y = [], []
-    for i in range(seq_len, len(df_feat) - horizon):
-        fr = future_return.iloc[i]
-
-        if abs(fr) <= threshold:
+    X, Y, W = [], [], []
+    for i in range(seq_len, n_rows):
+        if not valid_label[i] or not np.isfinite(raw_w[i]):
+            continue
+        # The label must resolve inside the available data.
+        if label_end[i] >= n_rows:
             continue
 
         window = X_raw[i - seq_len : i]
@@ -717,7 +895,14 @@ def add_features(
             continue
 
         X.append(window)
-        Y.append(1 if fr > threshold else 0)
+        Y.append(int(labels[i]))
+        W.append(float(raw_w[i]))
+
+    weights = np.array(W, dtype=np.float32)
+    if len(weights) and weights.sum() > 0:
+        weights = weights / weights.mean()  # mean 1, so loss scale is unchanged
+    else:
+        weights = np.ones(len(Y), dtype=np.float32)
 
     out = (
         np.array(X, dtype=np.float32),
@@ -725,6 +910,10 @@ def add_features(
         features,
         scaler,
     )
+    # weights before df_feat: existing callers do `*_, df_feat = add_features(...)`
+    # and must keep getting df_feat as the last element.
+    if return_weights:
+        out = out + (weights,)
     if return_df_feat:
         return out + (df_feat,)
     return out

@@ -1,11 +1,46 @@
 symbol: BTCUSDT
-data_path: technical_analysis_trainer/data/btcusdt_1h_train.csv
-epochs: 100
-learning_rate: 0.001
-hidden_size: 64
-horizon: 24
-cv_splits: 5
+# Shared with the trend model on purpose. These were separate files that drifted
+# 10 months apart in freshness (this one ended 2025-10-01 while trend's ended
+# 2026-04-17), so the two models were fitted to different market regimes and
+# neither matched what they were served. One dataset, refreshed by
+# data_fetch.binance_klines, keeps that from recurring.
+data_path: technical_analysis_trainer/data/train/btcusdt_1h.csv
 output_dir: technical_analysis_trainer/models/quantile/models
+seed: 42
+
+# ── Target ────────────────────────────────────────────────────────────────
+# horizon: how many bars ahead to forecast (1 = next hour)
+horizon: 1
+# vol_window: bars used for the conditioning volatility sigma_t that normalises
+# the target. Larger = steadier scale, slower to react to a regime change.
+vol_window: 72
+# Full conditional distribution, not just an 80% band — same training cost.
+quantiles: [0.05, 0.25, 0.5, 0.75, 0.95]
+
+# ── Evaluation protocol ───────────────────────────────────────────────────
+# Walk-forward folds: one test period is one regime, several give an error bar.
+n_folds: 3
+# Models averaged per fold. Seed variance dominates run-to-run spread, so
+# averaging beats picking the luckiest draw.
+n_seeds: 5
+
+# ── Model ─────────────────────────────────────────────────────────────────
+epochs: 200
+learning_rate: 0.0008
+hidden_size: 64
+num_layers: 2
+dropout_lstm: 0.2
+dropout_fc: 0.1
+weight_decay: 0.0005
+batch_size: 64
+# stop when val pinball loss has not improved for this many epochs
+patience: 20
+
+# ── Data ──────────────────────────────────────────────────────────────────
+# clip after StandardScaler, in train sigmas
+feature_scale_clip: 5.0
+val_ratio: 0.15
+test_ratio: 0.15
 window:
   short: 1
   mid: 12

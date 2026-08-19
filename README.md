@@ -36,6 +36,116 @@ quant-regressor/
     └── docs/                     # ТЗ, ADR, SLA
 ```
 
+## Обучение и протокол оценки
+
+Оба тренера используют walk-forward фолды, scaler на train, ансамбль по seed'ам
+и обязательные baseline'ы. Метрика без baseline ничего не значит.
+
+```bash
+# Quantile: 3 фолда x 5 seeds, conformal-калибровка, HAR-RV benchmark
+python -m technical_analysis_trainer.models.quantile.train
+
+# Trend: triple-barrier таргет, ансамбль + GBM baseline
+python -m technical_analysis_trainer.models.trend.train_v2
+
+# Проверка протокола (splits, embargo, conformal, HAR)
+python -m technical_analysis_trainer.core.test_validation
+```
+
+### Правила, зашитые в код
+
+**Выбор конфигурации — только по val.** `core.validation.select_by_val`
+выбрасывает исключение при попытке выбрать по test-метрике. Причина: в старом
+`train_runs.csv` 184 прогона дали ROC-AUC 0.5305 ± 0.0052 при нулевой
+корреляции с любым гиперпараметром (`hidden_size`: +0.000), а лучший прогон
+(0.5457) в точности совпадает с ожидаемым максимумом 184 шумовых выборок
+(0.5439). Выбор лучшего по test завышает метрику примерно на +2.5σ — в
+несколько раз больше реального эджа.
+
+**Embargo между сплитами.** Метки смотрят вперёд на `horizon` (или
+`max_holding` для triple barrier) баров; без разрыва последние train-метки
+залезают в val.
+
+**Ансамбль вместо лотереи seed'ов.** Разброс между seed'ами доминирует, поэтому
+модели усредняются (`QuantileEnsemble`, `TrendEnsemble`) — обе экспортируются в
+один ONNX-граф.
+
+### Что показывают метрики
+
+| Модель | Есть эдж | Нет эджа |
+|---|---|---|
+| Quantile | хвосты: pinball skill **+4.4% против HAR-RV**, покрытие 90.3% при номинале 90% | медиана: skill **+0.0003**, MAE не бьёт persistence |
+| Trend | triple barrier 2.5σ: val AUC 0.5237 | next_bar: AUC 0.5102; barrier 1.0σ: 0.4937 (хуже монетки) |
+
+Ширина барьера выбрана по **val** AUC: 1.75σ→0.5141, **2.5σ→0.5237**,
+3.5σ→0.5122. По test выиграл бы 3.5σ (0.5390) — это ровно та ошибка, от которой
+защищает правило выше.
+
+## Бэктест: прогон trend-модели по истории
+
+Проигрывает ту же модель, что отдаёт прод, по историческим свечам из локальных
+CSV — без сети и без БД. В консоль печатает отчёт по метрикам, в
+`artifacts/backtest.html` кладёт интерактивный график, где каждое предсказание —
+линия от своей свечи до барьера, который модель назвала, длиной ровно в горизонт
+(24 бара). Соседние линии красятся разными цветами (палитра из 24 цветов на
+24-барный горизонт), так что пересекающиеся линии всегда различимы.
+
+```bash
+# последние 500 свечей (по умолчанию, см. apps/backtest_config.yaml)
+python -m technical_analysis_trainer.apps.backtest
+# произвольный диапазон
+python -m technical_analysis_trainer.apps.backtest --start 2026-01-01 --end 2026-06-01
+# вся история, только отчёт в консоль
+python -m technical_analysis_trainer.apps.backtest --last-bars 0 --no-chart
+```
+
+Диапазон, шаг, путь к HTML и предел числа линий задаются в
+[`technical_analysis_trainer/apps/backtest_config.yaml`](technical_analysis_trainer/apps/backtest_config.yaml);
+любой ключ перебивается флагом CLI (`--help`). `trend_run: null` означает «тот же
+прогон, что в проде» — берётся `TREND_MODEL_RUN`, иначе `defaults.trend_run` из
+`assembly/config.yaml`.
+
+Модель триплбарьерная, поэтому и оценивается как триплбарьерная: эталон считает
+`features.triple_barrier_labels` — та же функция, что делала метки при обучении.
+Якоря, у которых за `max_holding` не задет ни один барьер, в точность не входят
+(как и при обучении) и показываются отдельной строкой `unresolved`.
+Проверка: прогон по тестовому фолду 2 даёт ROC-AUC 0.5860 / accuracy 55.61%
+против 0.5855 / 55.40%, которые напечатал `train_v2.py` для того же прогона.
+
+## Backfill: заполнение пропусков в предсказаниях
+
+Дашборд накладывает сохранённые прогнозы на свечи; свеча без строки в БД —
+дырка на графике (планировщик лежал, контейнер перезапускался и т.п.).
+
+```bash
+# посчитать, но не писать
+python -m technical_analysis_trainer.apps.backfill_predictions --bars 200 --dry-run
+# заполнить пропуски
+python -m technical_analysis_trainer.apps.backfill_predictions --bars 200
+# пересчитать всё заново
+python -m technical_analysis_trainer.apps.backfill_predictions --bars 200 --force
+```
+
+Через API: `POST /api/backfill?bars=200`, статус — `GET /api/backfill-status`.
+Автозапуск при старте: `BACKFILL_ON_START=1` (по умолчанию выключен; выполняется
+фоном и никогда не блокирует старт API).
+
+### Почему здесь нет утечки
+
+Наивный backfill скармливает модели всю историю, и прогноз «подглядывает» в
+собственное будущее — точность в панели статистики становится завышенной.
+Здесь гарантия структурная, а не на доверии:
+
+1. каждый входной фрейм (BTC + кросс-рынок) обрезается до `ts <= T` **до**
+   расчёта любой фичи — будущих строк просто не существует внутри вызова;
+2. обрезка проверяется `assert`, а не предполагается;
+3. окно якорится так, что его содержимое совпадает с live-путём в момент T
+   (`drop_last` для quantile, `last_row_is_closed` для trend).
+
+Проверка: `python -m technical_analysis_trainer.apps.test_backfill_predictions`
+— в частности, прогноз для T обязан быть **побитово одинаковым** с фреймом,
+содержащим будущие свечи, и без них.
+
 ## Prediction dashboard (local)
 
 Backend serves JSON (`candles`, live quantile forecast for the next hour, trend probabilities, and optional `quantile_history` from PostgreSQL). When `DATABASE_URL` is set and the scheduler has written rows, `/api/snapshot` includes past quantile forecasts for the visible candle window; the chart draws them as faded dashed segments. The trend pipeline needs the predict CSV from [`technical_analysis_trainer/models/trend/test_config.yaml`](technical_analysis_trainer/models/trend/test_config.yaml) (`data_path`) and ONNX/scaler under `models/trend/models/`. Quantile artifacts live under `technical_analysis_trainer/models/quantile/models/{QUANTILE_MODEL_RUN}/` (env `QUANTILE_MODEL_RUN`).

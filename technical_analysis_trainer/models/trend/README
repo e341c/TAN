@@ -175,3 +175,15 @@ python -m technical_analysis_trainer.models.trend.plots.audit_scaled_features --
 ```
 
 Граница клипа после `StandardScaler` задаётся в `config.yaml` как `feature_scale_clip` (число → симметрично, или `{ min, max }`). После каждого train в `train_runs.csv` пишутся колонки `scale_clip_min`, `scale_clip_max`; те же значения лежат в `scaler_*.pkl` для инференса.
+
+Бэктест по истории (метрики в консоль + график с 24-часовыми линиями предсказаний):
+
+```bash
+python -m technical_analysis_trainer.apps.backtest
+python -m technical_analysis_trainer.apps.backtest --start 2026-01-01 --end 2026-06-01
+python -m technical_analysis_trainer.apps.backtest --last-bars 0 --no-chart
+```
+
+В отличие от `plots.plot_model_predictions` (оценивает знак следующего бара), бэктест
+считает эталон через `features.triple_barrier_labels` — то есть по тому же таргету, на
+котором модель обучалась. Диапазон и вид графика — `apps/backtest_config.yaml`.

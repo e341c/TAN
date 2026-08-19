@@ -73,6 +73,8 @@ class TrendPrediction(Model):
     prob_down = DoubleField(null=True)
     prob_up = DoubleField(null=True)
     logits = TextField(null=True)
+    # JSON target definition; NULL means the row predates the spec => next_bar.
+    target_spec = TextField(null=True)
 
     class Meta:
         database = db_proxy
@@ -94,6 +96,9 @@ def init_db() -> None:
     db = get_database()
     db.create_tables([QuantilePrediction, TrendPrediction], safe=True)
     _run_sql_migration("002_trading_orders.sql")
+    # create_tables(safe=True) never alters an existing table, so a new column
+    # needs its own migration.
+    _run_sql_migration("003_trend_target_spec.sql")
 
 
 def _to_utc_datetime(ts: Any) -> datetime:
@@ -209,8 +214,39 @@ def list_trend_predictions(
             item["prob_up"] = float(row.prob_up)
         if row.prob_down is not None:
             item["prob_down"] = float(row.prob_down)
+        # Which question this row answered. Rows written by different models mean
+        # different things by "UP"/"DOWN", so the chart must be able to tell them
+        # apart instead of drawing one uniform overlay.
+        spec = _resolve_row_spec(row)
+        if spec:
+            item["target_mode"] = str(spec.get("mode", "next_bar"))
+            item["horizon_hours"] = spec.get("horizon_hours")
+            # Barrier geometry, so the chart can draw the horizon as an extent
+            # (anchor -> predicted barrier over N bars) instead of a bare point.
+            if spec.get("mode") == "triple_barrier":
+                item["upper_mult"] = spec.get("upper_mult")
+                item["lower_mult"] = spec.get("lower_mult")
+                item["vol_window"] = spec.get("vol_window")
+                item["max_holding"] = spec.get("max_holding")
+        if row.model_run_id:
+            item["model_run_id"] = str(row.model_run_id)
         out.append(item)
     return out
+
+
+def _resolve_row_spec(row) -> dict[str, Any] | None:
+    """Row's own spec, else the producing model's artifact (NULL for old rows)."""
+    raw = getattr(row, "target_spec", None)
+    if raw:
+        try:
+            spec = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(spec, dict) and spec.get("mode"):
+                return spec
+        except (ValueError, TypeError):
+            pass
+    from technical_analysis_trainer.storage.prediction_metrics import resolve_spec_for_run
+
+    return resolve_spec_for_run(str(row.model_run_id) if row.model_run_id else None)
 
 
 def _trend_probs(trend: dict[str, Any]) -> tuple[float | None, float | None]:
@@ -264,6 +300,10 @@ def save_snapshot(
 
     logits = trend.get("logits")
     logits_val = json.dumps([float(x) for x in logits]) if logits is not None else None
+    target_spec = trend.get("target")
+    target_spec_val = (
+        json.dumps(target_spec, ensure_ascii=False) if isinstance(target_spec, dict) else None
+    )
 
     prob_down, prob_up = _trend_probs(trend)
     trend_run_id = trend_meta.get("trend_run_id")
@@ -300,6 +340,7 @@ def save_snapshot(
         "prob_down": prob_down,
         "prob_up": prob_up,
         "logits": logits_val,
+        "target_spec": target_spec_val,
     }
 
     q_update = {
@@ -324,6 +365,7 @@ def save_snapshot(
         TrendPrediction.prob_down: prob_down,
         TrendPrediction.prob_up: prob_up,
         TrendPrediction.logits: logits_val,
+        TrendPrediction.target_spec: target_spec_val,
     }
 
     db = get_database()

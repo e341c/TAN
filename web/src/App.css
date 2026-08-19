@@ -264,6 +264,51 @@
   color: var(--text-muted);
 }
 
+/* The question the UP/DOWN badge answers. Without it the badge reads as
+   "next candle", which is wrong for barrier-target models. */
+.trend-target {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin: -0.35rem 0 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Baselines and CIs sit beside the headline number, deliberately de-emphasised
+   but always present — a metric without its baseline is not interpretable. */
+.stat-baseline {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 0.8rem;
+}
+
+.stat-row-sub {
+  opacity: 0.8;
+  font-size: 0.85rem;
+}
+
+.stat-row-median strong {
+  color: var(--chart-q50, inherit);
+}
+
+.stat-good strong {
+  color: var(--up, #16a34a);
+}
+
+/* Not an error state: it marks "this figure does not beat its baseline", which
+   is the common and important case here. */
+.stat-warn strong {
+  color: var(--text-muted);
+}
+
+.stats-warning {
+  border-left: 3px solid var(--down, #dc2626);
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
 .badge {
   display: inline-block;
   padding: 0.25rem 0.65rem;
@@ -302,6 +347,57 @@
   text-align: center;
 }
 
+/* Model performance stats */
+.stats-section {
+  margin-top: 2.5rem;
+  padding-top: 2rem;
+  border-top: 1px solid var(--border);
+}
+
+.stats-heading {
+  margin-bottom: 1.25rem;
+}
+
+.stats-heading h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.stats-heading p {
+  margin: 0;
+  max-width: 42rem;
+  font-size: 0.875rem;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.stats-meta {
+  margin-bottom: 1rem;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.stats-chart-card {
+  padding: 1.25rem;
+}
+
+.stats-chart-wrap {
+  height: 220px;
+  min-height: 220px;
+}
+
+.stats-legend {
+  margin-bottom: 0.75rem;
+}
+
 @media (max-width: 768px) {
   .page {
     padding: 1rem 1rem 2rem;
@@ -330,6 +426,10 @@
   }
 
   .forecast-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .stats-grid {
     grid-template-columns: 1fr;
   }
 

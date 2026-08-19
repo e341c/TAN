@@ -46,5 +46,7 @@ class TrendPlugin:
         assert self._store is not None
         cfg = context.trend_config or load_trend_config(context.trend_config_path)
         x_window, meta = build_trend_x_window(cfg, self._store, run_id=self._run_id)
-        payload = run_trend_onnx(x_window, str(meta["onnx_path"]))
+        payload = run_trend_onnx(
+            x_window, str(meta["onnx_path"]), target_spec=meta.get("target_spec")
+        )
         return ModelOutput(name=self.name, payload=payload, meta=meta)

@@ -5,6 +5,7 @@ Run from repo root:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -16,10 +17,13 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from technical_analysis_trainer.assembly.orchestrator import build_snapshot
+from technical_analysis_trainer.models.quantile.features import required_history
 from technical_analysis_trainer.runtime.binance import fetch_last_candles
+from technical_analysis_trainer.storage.prediction_metrics import compute_model_stats
 from technical_analysis_trainer.storage.prediction_store import (
     list_quantile_predictions,
     list_trend_predictions,
+    save_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,6 +55,66 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+_backfill_state: dict[str, Any] = {"status": "idle", "result": None, "error": None}
+
+
+async def _run_startup_backfill() -> None:
+    from technical_analysis_trainer.apps.backfill_predictions import backfill
+
+    bars = int(os.environ.get("BACKFILL_BARS", "200"))
+    _backfill_state["status"] = "running"
+    try:
+        res = await backfill(bars=bars)
+        _backfill_state.update(status="done", result=res.as_dict(), error=None)
+        logger.info("startup backfill complete: %s", res.as_dict())
+    except Exception as e:  # noqa: BLE001
+        _backfill_state.update(status="failed", error=f"{type(e).__name__}: {e}")
+        logger.warning("startup backfill failed: %s", e)
+
+
+@app.on_event("startup")
+async def _maybe_backfill() -> None:
+    """
+    Optionally fill prediction gaps for the displayed range at boot.
+
+    Off by default and always detached: filling 200 candles takes minutes, and
+    the dashboard must come up immediately regardless. A failure here is logged
+    and surfaced on /api/backfill-status, never raised — a gap in the chart is a
+    far smaller problem than an API that will not start.
+    """
+    if os.environ.get("BACKFILL_ON_START", "").strip().lower() not in {"1", "true", "yes"}:
+        return
+    if not os.environ.get("DATABASE_URL", "").strip():
+        logger.warning("BACKFILL_ON_START set but DATABASE_URL is not; skipping")
+        return
+    import asyncio
+
+    asyncio.create_task(_run_startup_backfill())
+
+
+@app.get("/api/backfill-status")
+def api_backfill_status() -> dict[str, Any]:
+    return dict(_backfill_state)
+
+
+@app.post("/api/backfill")
+async def api_backfill(
+    bars: int = Query(200, ge=30, le=1000),
+    dry_run: bool = Query(False),
+    max_fill: int | None = Query(None, ge=1, le=1000),
+) -> dict[str, Any]:
+    """Trigger a gap fill on demand."""
+    if not os.environ.get("DATABASE_URL", "").strip():
+        raise HTTPException(status_code=503, detail="DATABASE_URL is not set")
+    from technical_analysis_trainer.apps.backfill_predictions import backfill
+
+    try:
+        res = await backfill(bars=bars, dry_run=dry_run, max_fill=max_fill)
+        return res.as_dict()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"Backfill failed: {e}") from e
 
 
 def _ts_to_unix_seconds(ts: Any) -> int:
@@ -98,6 +162,11 @@ def _serialize_quantile(preds: dict[str, Any]) -> dict[str, Any]:
         "q50": float(preds["q50"]),
         "q90": float(preds["q90"]),
         "log_returns": lr,
+        # Full predicted distribution. The model emits five levels; q10/q90 above
+        # are interpolated from them for backward compatibility.
+        "quantiles": preds.get("quantiles"),
+        "quantile_levels": preds.get("quantile_levels"),
+        "sigma": preds.get("sigma"),
     }
 
 
@@ -106,6 +175,11 @@ def _serialize_trend(trend: dict[str, Any]) -> dict[str, Any]:
         "predicted_trend": trend.get("predicted_trend"),
         "probabilities": trend.get("probabilities"),
         "logits": [float(x) for x in (trend.get("logits") or [])],
+        # Ship the target definition with the label. A bare "UP"/"DOWN" is
+        # ambiguous between a 1h close and a 24h barrier touch, and both the web
+        # UI and the trading bot need to know which one they are looking at.
+        "target": trend.get("target"),
+        "horizon_hours": trend.get("horizon_hours"),
     }
 
 
@@ -113,7 +187,10 @@ def _serialize_trend(trend: dict[str, Any]) -> dict[str, Any]:
 async def api_snapshot(
     bars: int = Query(200, ge=30, le=1000, description="Number of recent candles to return"),
 ) -> dict[str, Any]:
-    limit = max(bars, 45)
+    # Fetch enough history for the slowest feature to warm up, independent of how
+    # many bars the chart shows. Sizing this off `bars` alone means a small chart
+    # request silently starves the model of history.
+    limit = max(bars, required_history() + 60)
     try:
         data = await fetch_last_candles("BTCUSDT", "1h", limit)
     except Exception as e:
@@ -136,6 +213,20 @@ async def api_snapshot(
     quant_preds = snapshot.quantile_dict() or {}
     trend_preds = snapshot.trend_dict() or {}
     trend_meta = snapshot.trend_meta()
+
+    # Persist the forecast we just computed. Without this the dashboard produces
+    # a fresh prediction on every page load and throws it away, so the only rows
+    # that ever reach the database are the scheduler's — and any hour the
+    # scheduler misses is a permanent hole. Never fatal: the chart must render
+    # even when the database is down.
+    if os.environ.get("DATABASE_URL", "").strip() and quant_preds and trend_preds:
+        try:
+            await asyncio.to_thread(
+                save_snapshot, snapshot, quantile=quant_preds,
+                trend=trend_preds, trend_meta=trend_meta,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("snapshot save failed: %s", e)
 
     meta: dict[str, Any] = {
         "server_time": datetime.now(timezone.utc).isoformat(),
@@ -194,3 +285,51 @@ async def api_snapshot(
         "trend_history": trend_history,
         "meta": meta,
     }
+
+
+def _load_trend_target_cfg() -> dict[str, Any]:
+    """Read the trend target definition from its config, with safe defaults."""
+    import yaml
+
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "models", "trend", "config.yaml",
+    )
+    try:
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except OSError:
+        cfg = {}
+    return {
+        "target_mode": str(cfg.get("target_mode", "next_bar")),
+        "triple_barrier": cfg.get("triple_barrier") or {},
+    }
+
+
+@app.get("/api/model-stats")
+async def api_model_stats(
+    limit: int = Query(200, ge=10, le=1000, description="Max mature predictions to evaluate"),
+) -> dict[str, Any]:
+    if not os.environ.get("DATABASE_URL", "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail="DATABASE_URL is not set; model stats require PostgreSQL",
+        )
+    try:
+        # The trend model's target must match how its predictions are scored.
+        # A triple-barrier model graded against the next bar's sign measures a
+        # different question entirely and reports a meaningless accuracy.
+        trend_cfg = _load_trend_target_cfg()
+        return await compute_model_stats(
+            "BTCUSDT",
+            "1h",
+            limit=limit,
+            trend_target_mode=trend_cfg["target_mode"],
+            trend_tb_cfg=trend_cfg["triple_barrier"],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Model stats failed: {e}") from e
