@@ -32,7 +32,11 @@ def _klines_to_df(klines: list) -> pd.DataFrame:
     # mean-filled at inference, pushing the input vector into a region the model
     # never saw in training — the served model then predicted a single class
     # regardless of market conditions.
-    df = df[["ts", "open", "high", "low", "close", "volume", "trades"]]
+    # `taker_buy_base` is kept for the same reason, and it is the same bug one
+    # column over: the training fetcher used to discard it, so it could not be a
+    # feature; now that it is one, dropping it here would leave the order-flow
+    # block mean-filled live while training saw real values.
+    df = df[["ts", "open", "high", "low", "close", "volume", "trades", "taker_buy_base"]]
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df.astype(
         {
@@ -42,6 +46,7 @@ def _klines_to_df(klines: list) -> pd.DataFrame:
             "close": float,
             "volume": float,
             "trades": float,
+            "taker_buy_base": float,
         }
     ).drop_duplicates(subset=["ts"], keep="last").sort_values("ts").reset_index(drop=True)
 

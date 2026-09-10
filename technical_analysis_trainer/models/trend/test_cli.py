@@ -187,6 +187,7 @@ def _df_and_feat_with_add_features(
     scale_lo: float,
     scale_hi: float,
     min_rows: int,
+    features_override: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Как train.py + add_features(..., scaler=...).
@@ -217,6 +218,11 @@ def _df_and_feat_with_add_features(
                 return_df_feat=True,
                 clip_low=scale_lo,
                 clip_high=scale_hi,
+                # Same reason as the cross/mtf note above: the column count has
+                # to match the artifact's scaler, so the feature-set switches
+                # come from config here too.
+                order_flow=True,
+                features_override=features_override,
             )
         except ValueError as e:
             last_err = e
@@ -355,6 +361,7 @@ def run_evaluation(
             scale_lo=scale_lo,
             scale_hi=scale_hi,
             min_rows=min_rows,
+            features_override=features,
         )
     except ValueError as e:
         if "Не удалось собрать фичи" not in str(e):

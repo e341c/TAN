@@ -11,3 +11,5 @@ services:
     image: ${TAN_WEB_IMAGE}
   scheduler:
     image: ${TAN_API_IMAGE}
+  liquidations:
+    image: ${TAN_API_IMAGE}

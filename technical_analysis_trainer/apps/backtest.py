@@ -18,11 +18,12 @@ labels, so the backtest grades the model against its own target.
 
 Three details that decide whether a backtest like this tells the truth:
 
-  * **Anchor convention.** `add_features` pairs window `X[i-seq_len:i]` with
-    `labels[i]`: the model sees bars up to `i-1` and the barrier originates at
-    `close[i]`. `predict.py` indexes identically. This module follows that, so a
-    line starts on the bar *after* the last bar the model saw — which is exactly
-    where the barrier levels are anchored.
+  * **Anchor convention, read from the artifact.** `target_spec["anchor"]` says
+    where the barrier sits relative to the window: `last_observed` puts the
+    barrier origin on the last bar the model saw, `next_close` (the legacy
+    convention, assumed for artifacts that predate the field) puts it one bar
+    later. Indexing the windows the other way shifts every prediction by a bar
+    and reports a model nobody is serving.
 
   * **One feature pass, not one per anchor.** Every rolling window here is
     backward-looking, so computing features once over the whole series gives the
@@ -36,15 +37,22 @@ Three details that decide whether a backtest like this tells the truth:
     is computed on resolved anchors only, and the excluded count is reported rather
     than quietly folded away.
 
-Known data gap, surfaced in the report rather than left silent: the SOL benchmark
-CSV ends 2026-04-17, so `xmkt_log_ret_sol` flattens to a constant for anchors after
-that date. Same class of failure that killed the ETH cross-market features.
+Data gaps are surfaced in the report rather than left silent: when a benchmark or
+macro CSV ends before the last anchor, `attach_cross_market_features` forward-fills
+it, so its feature flattens to a constant while the model keeps being scored on it.
+The report names every such source and the date it stops. Same class of failure
+that killed the ETH cross-market features.
+
+`data:` in the config may override the benchmark and macro paths that would
+otherwise come from the trend config. That is what lets the same code score the
+training CSVs and the unseen candles in `data/holdout/` — see
+`apps/holdout_eval.py` and `data_fetch/holdout.py`.
 """
 from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +65,8 @@ from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, r
 from technical_analysis_trainer.assembly.orchestrator import _run_id_for, load_assembly_config
 from technical_analysis_trainer.core.artifacts import ArtifactStore, resolve_path
 from technical_analysis_trainer.core.dataset import load_dataset
-from technical_analysis_trainer.core.metrics import bootstrap_ci
+from technical_analysis_trainer.core.calibration import brier, reliability_table
+from technical_analysis_trainer.core.metrics import block_bootstrap_ci, effective_n
 from technical_analysis_trainer.core.validation import dead_features
 from technical_analysis_trainer.models._paths import package_models_dir
 from technical_analysis_trainer.models.trend.features import (
@@ -68,9 +77,15 @@ from technical_analysis_trainer.models.trend.features import (
 )
 from technical_analysis_trainer.models.trend.predict import (
     backfill_missing_features_with_scaler_means,
+    load_calibrator,
     load_target_spec,
+    trailing_prior_from_candles,
 )
-from technical_analysis_trainer.models.trend.target import horizon_label
+from technical_analysis_trainer.models.trend.target import (
+    ANCHOR_LAST_OBSERVED,
+    horizon_label,
+    spec_anchor,
+)
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "backtest_config.yaml"
 # ONNX batch size. The exported graph has a dynamic batch axis (see
@@ -110,6 +125,10 @@ class BacktestResult:
     interval: str
     bar: pd.Timedelta
     oos_start: pd.Timestamp | None   # estimated first out-of-sample anchor
+    source_ends: dict[str, pd.Timestamp] = field(default_factory=dict)  # last ts per cross-market input
+    unseen_from: pd.Timestamp | None = None  # hard cutoff: bars later than this postdate training
+    calibrator: Any = None  # the artifact's Platt correction + decision threshold
+    decision_cut: float = 0.5  # cut actually used (0.5 once the prior shift re-centres)
 
     @property
     def resolved(self) -> pd.DataFrame:
@@ -117,15 +136,68 @@ class BacktestResult:
         return self.frame[self.frame["actual"] >= 0]
 
     @property
+    def oos_boundary(self) -> tuple[pd.Timestamp | None, str]:
+        """
+        First out-of-sample anchor, and how confident that boundary is.
+
+        `unseen_from` is a hard fact — a candle later than the artifact's export
+        stamp cannot have been in its training set. `oos_start` is a guess
+        recovered by re-deriving the walk-forward split, which shifts whenever the
+        CSV grows. Prefer the fact when the caller supplied one.
+        """
+        if self.unseen_from is not None:
+            return self.unseen_from, "exact"
+        return self.oos_start, "estimated"
+
+    @property
     def out_of_sample(self) -> pd.DataFrame:
-        """Resolved anchors the model almost certainly did not train on."""
+        """Resolved anchors the model did not train on."""
         res = self.resolved
-        if self.oos_start is None:
+        boundary, _ = self.oos_boundary
+        if boundary is None:
             return res
-        return res[pd.to_datetime(res["ts"], utc=True) >= self.oos_start]
+        return res[pd.to_datetime(res["ts"], utc=True) >= boundary]
 
 
 # ── Core ─────────────────────────────────────────────────────────────────────
+
+
+def _override_cross_market_paths(trend_cfg: dict[str, Any], data_cfg: dict[str, Any]) -> None:
+    """
+    Point the benchmark/macro inputs at the CSVs named in the backtest config.
+
+    Mutates `trend_cfg` in place. Only the *paths* move — every window, tolerance
+    and correlation setting still comes from the trend config, because those
+    define the feature set the scaler was fitted on and changing them would score
+    the model on inputs it never saw.
+    """
+    cross = trend_cfg.get("cross_market") or {}
+    benches = cross.get("benchmarks") or {}
+    macro = cross.get("macro") or {}
+    for key, section in (("eth", benches), ("sol", benches), ("dxy", macro), ("risk_proxy", macro)):
+        override = data_cfg.get(key)
+        if override and key in section:
+            section[key]["path"] = str(override)
+
+
+def _cross_market_source_ends(trend_cfg: dict[str, Any]) -> dict[str, pd.Timestamp]:
+    """Last timestamp in every configured benchmark/macro CSV, for the staleness check."""
+    cross = trend_cfg.get("cross_market") or {}
+    if not cross.get("enabled", False):
+        return {}
+    ends: dict[str, pd.Timestamp] = {}
+    for section in ((cross.get("benchmarks") or {}), (cross.get("macro") or {})):
+        for key, entry in section.items():
+            path = (entry or {}).get("path")
+            if not path:
+                continue
+            try:
+                ts = pd.to_datetime(pd.read_csv(resolve_path(path), usecols=["ts"])["ts"], utc=True)
+            except Exception:  # noqa: BLE001 - a missing source is already handled downstream
+                continue
+            if len(ts):
+                ends[key] = ts.max()
+    return ends
 
 
 def _barrier_sigma(close: pd.Series, vol_window: int) -> np.ndarray:
@@ -142,6 +214,7 @@ def run_backtest(cfg: dict[str, Any], *, run_id: str | None = None) -> BacktestR
     trend_cfg_path = data_cfg.get("trend_config") or "technical_analysis_trainer/models/trend/config.yaml"
     with open(resolve_path(trend_cfg_path), encoding="utf-8") as f:
         trend_cfg = yaml.safe_load(f)
+    _override_cross_market_paths(trend_cfg, data_cfg)
 
     # Which run to score. Falling through to the assembly config means "whatever
     # production is serving" is the default, which is the question people
@@ -179,8 +252,22 @@ def run_backtest(cfg: dict[str, Any], *, run_id: str | None = None) -> BacktestR
         return_df_feat=True,
         clip_low=clip_lo,
         clip_high=clip_hi,
+        # Build every available column and select by the artifact's own list,
+        # so the backtest scores the feature set the model was actually fitted
+        # with rather than whatever the config currently says.
+        order_flow=True,
+        features_override=features,
+        # Same reasoning as the live path: build every column the artifact might
+        # want, and let its own feature list select.
+        target_mode=str(spec.get("mode", "next_bar")),
+        tb_cfg=spec,
+        label_autocorr=True,
     )
-    df_feat, _ = backfill_missing_features_with_scaler_means(df_feat, features, scaler)
+    df_feat, filled = backfill_missing_features_with_scaler_means(df_feat, features, scaler)
+    if filled:
+        print(f"  ⚠ backtest: {len(filled)} feature(s) absent from the source data, filled "
+              f"with training means — the model is being scored off-distribution: "
+              f"{', '.join(filled)}")
     df_feat = df_feat.reset_index(drop=True)
 
     X = np.clip(
@@ -227,10 +314,16 @@ def run_backtest(cfg: dict[str, Any], *, run_id: str | None = None) -> BacktestR
         raise ValueError("configured range selects no anchors — check range.start / range.end")
 
     # ── Batched inference ─────────────────────────────────────────────────────
-    # windows[k] == X[k : k + seq_len], so the window ending before anchor i is
-    # windows[i - seq_len]. Same slice add_features and predict.py use.
+    # windows[k] == X[k : k + seq_len]. Which window belongs to anchor i depends
+    # on the artifact's anchor convention, read from its own target spec:
+    #   last_observed  X[i-seq_len+1 : i+1]  = windows[i - seq_len + 1]  (bar i inside)
+    #   next_close     X[i-seq_len   : i]    = windows[i - seq_len]      (legacy)
+    # Getting this wrong shifts every window by one bar and silently reports a
+    # model nobody is serving, which is what test_batch_scoring_matches_the_live_path
+    # exists to catch.
+    shift = 1 if spec_anchor(spec) == ANCHOR_LAST_OBSERVED else 0
     windows = np.lib.stride_tricks.sliding_window_view(X, (seq_len, X.shape[1]))[:, 0]
-    batch = np.ascontiguousarray(windows[idx - seq_len])
+    batch = np.ascontiguousarray(windows[idx - seq_len + shift])
     sess = ort.InferenceSession(str(run.onnx_path))
     name = sess.get_inputs()[0].name
     logits = np.concatenate(
@@ -242,8 +335,20 @@ def run_backtest(cfg: dict[str, Any], *, run_id: str | None = None) -> BacktestR
     # TrendEnsemble emits log(mean(softmax(members))), so softmaxing here returns
     # the ensemble probability unchanged — exactly what run_trend_onnx does.
     e = np.exp(logits - logits.max(axis=1, keepdims=True))
-    p_up = (e / e.sum(axis=1, keepdims=True))[:, 1]
-    pred = (p_up >= 0.5).astype(int)
+    p_raw = (e / e.sum(axis=1, keepdims=True))[:, 1]
+    # Same calibration and decision cut the served path applies, from the same
+    # artifact. Scoring raw probabilities against a 0.5 cut here would report a
+    # model that differs from the one in production by exactly the correction
+    # that was added to fix its base rate.
+    cal = load_calibrator(store, run.run_id)
+    # Trailing resolved base rate at each anchor, computed the same way the
+    # served path computes it — from labels that had already resolved by that
+    # bar, never from the anchor's own outcome.
+    prior_series = trailing_prior_from_candles(df_feat, spec)
+    prior_at = None if prior_series is None else prior_series[idx]
+    p_up = np.asarray(cal.shift(p_raw, prior_at), dtype=np.float64)
+    cut = cal.cut(prior_at)
+    pred = (p_up >= cut).astype(int)
 
     anchor_close = close.to_numpy()[idx]
     anchor_sigma = sigma[idx]
@@ -254,11 +359,15 @@ def run_backtest(cfg: dict[str, Any], *, run_id: str | None = None) -> BacktestR
         {
             "i": idx,
             "ts": df_feat["ts"].to_numpy()[idx],
-            # The last bar the model actually saw, one before the barrier origin.
-            "window_end_ts": df_feat["ts"].to_numpy()[idx - 1],
+            # The last bar the model actually saw. Under `last_observed` that is
+            # the barrier origin itself; under the legacy convention it is the
+            # bar before it.
+            "window_end_ts": df_feat["ts"].to_numpy()[idx - 1 + shift],
             "close": anchor_close,
             "sigma": anchor_sigma,
             "p_up": p_up,
+            "p_up_raw": p_raw,
+            "prior_now": (np.full(len(idx), np.nan) if prior_at is None else prior_at),
             "pred": pred,
             "actual": labels[idx],
             "span": spans[idx],
@@ -274,9 +383,13 @@ def run_backtest(cfg: dict[str, Any], *, run_id: str | None = None) -> BacktestR
         ["ts", "open", "high", "low", "close"]
     ].reset_index(drop=True)
 
+    unseen = cfg.get("unseen_from")
     return BacktestResult(
         frame=frame, candles=candles, run_id=run.run_id, spec=spec, features=features,
         dead=dead, symbol=symbol, interval=interval, bar=bar, oos_start=oos_start,
+        source_ends=_cross_market_source_ends(trend_cfg),
+        unseen_from=_utc(unseen) if unseen is not None else None,
+        calibrator=cal, decision_cut=float(cut),
     )
 
 
@@ -351,17 +464,32 @@ def format_report(r: BacktestResult) -> str:
         f"  range           {f['ts'].iloc[0]}  ..  {f['ts'].iloc[-1]}",
         f"  anchors         {len(f)}",
     ]
+    if r.unseen_from is not None:
+        lines.append(f"  unseen from     {r.unseen_from:%Y-%m-%d %H:%M} UTC (model's training cutoff)")
+    if r.calibrator is not None:
+        cal = r.calibrator
+        lines.append(
+            f"  calibration     {'Platt a=%.3f b=%.3f (n=%d)' % (cal.a, cal.b, cal.n) if cal.n else 'none (uncalibrated artifact)'}"
+            f"   decision cut {r.decision_cut:.3f}"
+        )
+        if cal.prior_shift:
+            lines.append(
+                f"  prior shift     on — re-centred from {cal.prior_ref:.4f} onto the "
+                f"trailing resolved base rate (mean {r.frame['prior_now'].mean():.4f} over this range)"
+            )
     if r.dead:
         lines.append(f"  ⚠ dead features {', '.join(r.dead)}  (constant when the scaler was fitted)")
-    flat = _flat_cross_market(f)
-    if flat:
-        lines.append(f"  ⚠ stale inputs  {flat}")
+    for flat in _flat_cross_market(f, r.source_ends):
+        lines.append(f"  ⚠ stale input   {flat}")
 
     unresolved = int((f["actual"] < 0).sum())
+    n_eff = effective_n(f["span"].to_numpy(), (f["actual"] >= 0).to_numpy())
     lines += [
         "",
         "── Coverage ──",
         f"  scored          {len(res)}  of {len(f)} anchors",
+        f"  effective n     {n_eff:.0f}  (mean uniqueness {n_eff / max(len(res), 1):.3f}) — "
+        f"overlapping barrier paths, so {len(res)} labels are not {len(res)} observations",
         f"  unresolved      {unresolved}  ({pct(unresolved / max(len(f), 1))}) — neither barrier "
         f"touched within {r.spec.get('max_holding', '?')} bars, dropped in training too",
     ]
@@ -372,20 +500,28 @@ def format_report(r: BacktestResult) -> str:
     y, p, prob = res["actual"].to_numpy(), res["pred"].to_numpy(), res["p_up"].to_numpy()
     correct = (y == p).astype(float)
     acc = float(correct.mean())
-    lo, hi = bootstrap_ci(correct)
+    # Block bootstrap, not i.i.d.: consecutive anchors share most of their
+    # barrier path, so resampling single anchors gives an interval about
+    # sqrt(1/uniqueness) too narrow. Blocks of max_holding keep the overlap.
+    block = int(r.spec.get("max_holding", 24))
+    lo, hi = block_bootstrap_ci(correct, block=block)
     majority = float(max(y.mean(), 1 - y.mean()))
     prec, rec, _f1, sup = precision_recall_fscore_support(y, p, labels=[0, 1], zero_division=0)
     tn, fp, fn, tp = confusion_matrix(y, p, labels=[0, 1]).ravel()
 
+    boundary, kind = r.oos_boundary
     in_sample = len(res) - len(r.out_of_sample)
-    if in_sample > 0:
+    if in_sample > 0 and boundary is not None:
         lines += [
             "",
             "── ⚠ In-sample overlap ──",
             f"  {in_sample} of {len(res)} scored anchors ({pct(in_sample / len(res))}) fall before "
-            f"{r.oos_start:%Y-%m-%d}, which the model was almost certainly trained on.",
+            f"{boundary:%Y-%m-%d}, which the model was "
+            + ("trained on." if kind == "exact" else "almost certainly trained on."),
             "  Metrics below are therefore optimistic. See the out-of-sample block at the end;",
-            "  the boundary is estimated by re-deriving the walk-forward split, so it is approximate.",
+            "  the boundary is the artifact's export stamp, so it is exact."
+            if kind == "exact"
+            else "  the boundary is estimated by re-deriving the walk-forward split, so it is approximate.",
         ]
 
     lines += [
@@ -408,12 +544,27 @@ def format_report(r: BacktestResult) -> str:
         f"  actual          DOWN {pct((y == 0).mean())}   UP {pct((y == 1).mean())}",
     ]
 
-    # Confidence is distance from 0.5: a small edge is usually concentrated in the
-    # bars the model is most sure about, which a single accuracy number hides.
-    conf = np.abs(prob - 0.5)
+    # Calibration: does the probability mean what it says? Reported separately
+    # from AUC because they answer different questions and a fix to one moves
+    # neither the other — a monotone recalibration cannot reorder anything.
+    lines += [
+        "",
+        "── Calibration ──",
+        f"  mean p(UP)      {prob.mean():.4f}   actual UP rate {y.mean():.4f}   "
+        f"gap {y.mean() - prob.mean():+.4f}",
+        f"  Brier           {brier(prob, y):.4f}",
+        f"  {'mean p':>12}{'actual':>10}{'n':>7}",
+    ]
+    for mp, obs, cnt in reliability_table(prob, y):
+        lines.append(f"  {mp:12.4f}{obs:10.4f}{cnt:7d}")
+
+    # Confidence is distance from the decision cut: a small edge is usually
+    # concentrated in the bars the model is most sure about, which a single
+    # accuracy number hides.
+    conf = np.abs(prob - r.decision_cut)
     order = np.argsort(conf)
     lines += ["", "── Accuracy by confidence decile ──",
-              f"  {'decile':<8}{'|p-0.5|':>12}{'n':>7}{'accuracy':>11}"]
+              f"  {'decile':<8}{'|p-cut|':>12}{'n':>7}{'accuracy':>11}"]
     for d in range(10):
         sel = order[int(d * len(order) / 10) : int((d + 1) * len(order) / 10)]
         if len(sel) == 0:
@@ -429,11 +580,11 @@ def format_report(r: BacktestResult) -> str:
     if in_sample > 0 and len(oos) > 30 and oos["actual"].nunique() > 1:
         yo, po, probo = oos["actual"].to_numpy(), oos["pred"].to_numpy(), oos["p_up"].to_numpy()
         co = (yo == po).astype(float)
-        olo, ohi = bootstrap_ci(co)
+        olo, ohi = block_bootstrap_ci(co, block=block)
         omaj = float(max(yo.mean(), 1 - yo.mean()))
         lines += [
             "",
-            f"── Out-of-sample only (from {r.oos_start:%Y-%m-%d}, estimated) ──",
+            f"── Out-of-sample only (from {boundary:%Y-%m-%d}, {kind}) ──",
             f"  n               {len(oos)}",
             f"  accuracy        {pct(float(co.mean()))}  (95% CI {pct(olo)}–{pct(ohi)})",
             f"  ROC-AUC         {roc_auc_score(yo, probo):.4f}",
@@ -443,13 +594,30 @@ def format_report(r: BacktestResult) -> str:
     return "\n".join(lines)
 
 
-def _flat_cross_market(frame: pd.DataFrame) -> str:
-    """SOL's CSV stops in Apr 2026; say so instead of letting a dead input pass."""
-    last = pd.Timestamp(frame["ts"].iloc[-1])
-    sol_end = pd.Timestamp("2026-04-17", tz="UTC")
-    if last > sol_end:
-        return f"solusdt CSV ends {sol_end.date()}, xmkt_log_ret_sol is constant after that"
-    return ""
+def _flat_cross_market(frame: pd.DataFrame, source_ends: dict[str, pd.Timestamp]) -> list[str]:
+    """
+    Name every cross-market input that runs out before the last anchor.
+
+    `attach_cross_market_features` forward-fills, so a source that stops mid-range
+    does not error — its feature just freezes at the last known value while the
+    model keeps being graded on it. Derived from the files themselves rather than
+    a hardcoded date, so refreshing a CSV clears the warning on its own.
+
+    Macro series are daily and publish with a lag, so a couple of days of tail is
+    normal and not worth flagging.
+    """
+    if not source_ends:
+        return []
+    last = _utc(frame["ts"].iloc[-1])
+    tolerance = {"dxy": pd.Timedelta(days=14), "risk_proxy": pd.Timedelta(days=5)}
+    out = []
+    for key, end in sorted(source_ends.items()):
+        if last - end > tolerance.get(key, pd.Timedelta(0)):
+            out.append(
+                f"{key} ends {end:%Y-%m-%d %H:%M}, {(last - end).days}d before the last anchor "
+                f"— xmkt_log_ret_{key} is forward-filled after that"
+            )
+    return out
 
 
 # ── Chart ────────────────────────────────────────────────────────────────────

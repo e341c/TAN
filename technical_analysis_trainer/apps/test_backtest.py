@@ -8,8 +8,17 @@ batched ONNX calls; the live path rebuilds features per anchor from a stitched
 frame. If those two ever disagree, the numbers this tool prints describe a model
 nobody is actually serving. `apps/test_backfill_predictions.py` already pins
 live-vs-backfill; this closes the third corner.
+
+Everything runs over **holdout candles** — bars that closed after the model was
+exported, fetched on demand by `data_fetch/holdout.py` and cached while fresh.
+Set HOLDOUT_OFFLINE=1 to forbid fetching and fail instead. Scoring the agreement
+on data the model was fitted on is the weaker test: a memorised window can return
+the same answer for two subtly different inputs and hide the very windowing bug
+this file exists to catch.
 """
 from __future__ import annotations
+
+import os
 
 import numpy as np
 import pandas as pd
@@ -17,39 +26,82 @@ import yaml
 
 from technical_analysis_trainer.apps.backtest import (
     _apply_range,
-    load_config,
+    _override_cross_market_paths,
     run_backtest,
 )
+from technical_analysis_trainer.apps.holdout_eval import trend_backtest_config
 from technical_analysis_trainer.core.artifacts import ArtifactStore, resolve_path
 from technical_analysis_trainer.core.dataset import load_dataset
+from technical_analysis_trainer.data_fetch.holdout import ensure_holdout
 from technical_analysis_trainer.models._paths import package_models_dir
 from technical_analysis_trainer.models.trend.predict import (
     build_trend_x_window_from_frames,
     run_trend_onnx,
 )
+from technical_analysis_trainer.models.trend.target import ANCHOR_LAST_OBSERVED, spec_anchor
 
 TREND_CFG = "technical_analysis_trainer/models/trend/config.yaml"
+ANCHORS = 120
 _CACHE: dict[str, object] = {}
 
 
+def _holdout():
+    if "holdout" not in _CACHE:
+        _CACHE["holdout"] = ensure_holdout(
+            offline=os.environ.get("HOLDOUT_OFFLINE") == "1", quiet=True
+        )
+    return _CACHE["holdout"]
+
+
+def _holdout_config() -> dict:
+    """Backtest config pinned to the holdout CSVs, unseen anchors only."""
+    return trend_backtest_config(_holdout())
+
+
 def _small_result():
-    """One backtest over a short recent window, reused across tests."""
+    """One backtest over a short window of unseen bars, reused across tests."""
     if "result" not in _CACHE:
-        cfg = load_config()
-        cfg["range"] = {"last_bars": 120, "start": None, "end": None, "stride": 1}
+        h = _holdout()
+        cfg = _holdout_config()
+        # `start` already excludes everything the model trained on; cap the window
+        # at the oldest ANCHORS bars after it so the size is deterministic and the
+        # suite does not slow down as the holdout grows. Derived from the CSV's own
+        # timestamps rather than from a throwaway full backtest.
+        ts = pd.to_datetime(pd.read_csv(h.btc, usecols=["ts"])["ts"], utc=True)
+        unseen = ts[ts > h.cutoff].reset_index(drop=True)
+        if len(unseen) < ANCHORS:
+            raise AssertionError(
+                f"only {len(unseen)} unseen bars available, need {ANCHORS} — refresh the "
+                "holdout (python -m technical_analysis_trainer.data_fetch.holdout)"
+            )
+        cfg["range"]["end"] = unseen.iloc[ANCHORS - 1].isoformat()
         _CACHE["result"] = run_backtest(cfg)
     return _CACHE["result"]
+
+
+def test_every_anchor_is_unseen() -> None:
+    """The premise of the rest of this file, asserted rather than assumed."""
+    r = _small_result()
+    cutoff = _holdout().cutoff
+    first = pd.Timestamp(r.frame["ts"].iloc[0])
+    assert first > cutoff, f"first anchor {first} is not after the export cutoff {cutoff}"
+    assert r.unseen_from == cutoff, "backtest was not told where the unseen window starts"
+    assert len(r.out_of_sample) == len(r.resolved), "some scored anchors predate the cutoff"
 
 
 def test_batch_scoring_matches_the_live_path() -> None:
     r = _small_result()
     with open(resolve_path(TREND_CFG), encoding="utf-8") as f:
         trend_cfg = yaml.safe_load(f)
+    # The live path must read the same CSVs the backtest did, or a mismatch here
+    # would just be reporting that two different SOL series give two different
+    # answers — which is true and uninteresting.
+    _override_cross_market_paths(trend_cfg, _holdout_config()["data"])
     store = ArtifactStore(package_models_dir("trend"))
 
     frames = {}
     for key, path in (
-        ("btc", trend_cfg["data_path"]),
+        ("btc", _holdout_config()["data"]["btc"]),
         ("eth", ((trend_cfg["cross_market"]["benchmarks"].get("eth") or {}).get("path"))),
         ("sol", ((trend_cfg["cross_market"]["benchmarks"].get("sol") or {}).get("path"))),
     ):
@@ -74,7 +126,19 @@ def test_batch_scoring_matches_the_live_path() -> None:
         assert pd.Timestamp(meta["last_ts"]) == cut, (
             f"live path anchored on {meta['last_ts']}, backtest window ends {cut}"
         )
-        live = run_trend_onnx(x, str(meta["onnx_path"]))["probabilities"]["UP"]
+        # Pass the artifact's calibrator AND the trailing prior, because the
+        # backtest applies both. Comparing a corrected number against an
+        # uncorrected one would fail for a reason that has nothing to do with
+        # the windowing this test is about.
+        #
+        # This also makes the check stronger than it looks: the live prior is
+        # computed from a frame trimmed at the anchor, the batch one from the
+        # full series, so agreement here is evidence that the base-rate estimate
+        # is not reading resolutions from after the anchor.
+        live = run_trend_onnx(
+            x, str(meta["onnx_path"]), calibrator=meta.get("calibrator"),
+            prior_now=meta.get("prior_now"),
+        )["probabilities"]["UP"]
         assert abs(live - row.p_up) < 1e-3, (
             f"anchor {row.ts}: live p(UP)={live:.6f} vs batch {row.p_up:.6f}"
         )
@@ -132,11 +196,20 @@ def test_range_start_end_select_exactly_those_anchors() -> None:
 
 def test_range_covers_the_configured_window() -> None:
     r = _small_result()
-    assert len(r.frame) == 120, f"last_bars=120 should give 120 anchors, got {len(r.frame)}"
+    assert len(r.frame) == ANCHORS, (
+        f"the start/end window should give {ANCHORS} anchors, got {len(r.frame)}"
+    )
     assert r.frame["ts"].is_monotonic_increasing
-    # Each anchor sits exactly one bar after the last candle its window saw.
+    # Where the anchor sits relative to the window depends on the artifact's own
+    # convention, so read it rather than assume one:
+    #   last_observed  the barrier origin IS the last bar in the window (gap 0)
+    #   next_close     it is the bar after it (gap 1)
+    expected = pd.Timedelta(0) if spec_anchor(r.spec) == ANCHOR_LAST_OBSERVED else r.bar
     delta = pd.to_datetime(r.frame["ts"]) - pd.to_datetime(r.frame["window_end_ts"])
-    assert (delta == r.bar).all(), "anchor must be one bar after the window end"
+    assert (delta == expected).all(), (
+        f"anchor/window gap should be {expected} for anchor={spec_anchor(r.spec)}, "
+        f"got {delta.unique()}"
+    )
 
 
 if __name__ == "__main__":
@@ -146,8 +219,8 @@ if __name__ == "__main__":
         try:
             t()
             print(f"  PASS  {t.__name__}")
-        except AssertionError as e:
+        except Exception as e:  # noqa: BLE001 - a missing holdout must report, not traceback
             failed += 1
-            print(f"  FAIL  {t.__name__}: {e}")
+            print(f"  FAIL  {t.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     raise SystemExit(1 if failed else 0)

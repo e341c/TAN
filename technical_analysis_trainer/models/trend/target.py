@@ -24,6 +24,22 @@ NEXT_BAR = "next_bar"
 TRIPLE_BARRIER = "triple_barrier"
 
 
+# Where the barrier is anchored, relative to the window the model sees.
+#
+#   LAST_OBSERVED  barriers start at the close of the last bar IN the window.
+#                  The model can see the price its barriers are measured from,
+#                  and the bot can place that level the moment it gets a signal.
+#   NEXT_CLOSE     barriers start at the close of the bar AFTER the window
+#                  (the original convention). The anchor price is unobserved:
+#                  measured on BTC 1h in Aug 2026, one bar of noise is 43.9% of
+#                  the 2.5-sigma barrier half-width, so nearly half the target's
+#                  variance was unpredictable by construction. At serving time
+#                  that bar has not closed yet, so the level the bot places is
+#                  not the level the label used.
+ANCHOR_LAST_OBSERVED = "last_observed"
+ANCHOR_NEXT_CLOSE = "next_close"
+
+
 def build_target_spec(
     target_mode: str,
     tb_cfg: dict[str, Any] | None = None,
@@ -31,6 +47,7 @@ def build_target_spec(
     horizon: int = 1,
     threshold: float = 0.001,
     bar_hours: float = 1.0,
+    anchor: str = ANCHOR_LAST_OBSERVED,
 ) -> dict[str, Any]:
     """Serialisable description of what the model predicts."""
     tb = tb_cfg or {}
@@ -44,9 +61,11 @@ def build_target_spec(
             "vol_window": int(tb.get("vol_window", 72)),
             "horizon_bars": max_holding,
             "horizon_hours": max_holding * bar_hours,
+            "anchor": anchor,
             "description": (
                 f"P(price touches +{float(tb.get('upper_mult', 2.5))}*sigma before "
-                f"-{float(tb.get('lower_mult', 2.5))}*sigma within {max_holding} bars)"
+                f"-{float(tb.get('lower_mult', 2.5))}*sigma within {max_holding} bars, "
+                f"from the {'last observed close' if anchor == ANCHOR_LAST_OBSERVED else 'next close'})"
             ),
         }
     return {
@@ -54,8 +73,20 @@ def build_target_spec(
         "threshold": float(threshold),
         "horizon_bars": int(horizon),
         "horizon_hours": int(horizon) * bar_hours,
+        "anchor": anchor,
         "description": f"P(return over {horizon} bar(s) exceeds +/-{threshold})",
     }
+
+
+def spec_anchor(spec: dict[str, Any] | None) -> str:
+    """
+    Anchor convention for a spec, defaulting to the legacy one.
+
+    An artifact exported before the anchor was recorded was trained with the
+    barrier on the *next* close, so a missing key must read as NEXT_CLOSE.
+    Defaulting the other way would silently re-index every window a bar late.
+    """
+    return str((spec or {}).get("anchor") or ANCHOR_NEXT_CLOSE)
 
 
 def default_spec() -> dict[str, Any]:
@@ -65,7 +96,7 @@ def default_spec() -> dict[str, Any]:
     Every run before 2026-08-16 was trained on next-bar sign, so that is the
     honest default — not the currently-configured mode.
     """
-    return build_target_spec(NEXT_BAR)
+    return build_target_spec(NEXT_BAR, anchor=ANCHOR_NEXT_CLOSE)
 
 
 def spec_from_bundle(bundle: dict[str, Any] | None) -> dict[str, Any]:
@@ -79,7 +110,7 @@ def spec_from_bundle(bundle: dict[str, Any] | None) -> dict[str, Any]:
     if mode == TRIPLE_BARRIER:
         # Bundle knows the mode but predates the full spec: fall back to the
         # trained defaults rather than to next_bar, which would be wrong.
-        return build_target_spec(TRIPLE_BARRIER, {})
+        return build_target_spec(TRIPLE_BARRIER, {}, anchor=ANCHOR_NEXT_CLOSE)
     return default_spec()
 
 

@@ -3,7 +3,16 @@ Leak tests for the prediction backfill.
 
 Run: python -m technical_analysis_trainer.apps.test_backfill_predictions
 
-These use the real ONNX artifacts and the CSV history — no network, no database.
+These use the real ONNX artifacts against **holdout candles** — bars that closed
+after the artifacts were exported, so the models have never seen them. The cache
+is fetched on demand by `data_fetch/holdout.py` and reused while fresh; set
+HOLDOUT_OFFLINE=1 to forbid fetching and fail instead.
+
+Why unseen data matters even for leak tests: these anchors are the ones the
+backfill actually runs on in production, and a frame the model has memorised can
+mask a windowing bug by returning the same answer for two slightly different
+inputs. `test_anchors_are_unseen` pins the property rather than trusting it.
+
 The central claim being tested is that a backfilled prediction for candle T is
 identical whether or not the source frame contains candles after T. If that ever
 stops holding, backfilled forecasts are seeing their own future and every
@@ -11,11 +20,14 @@ accuracy number computed from them is inflated.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 
 from technical_analysis_trainer.apps.backfill_predictions import _trim_to, _utc
 from technical_analysis_trainer.core.artifacts import ArtifactStore
+from technical_analysis_trainer.data_fetch.holdout import ensure_holdout
 from technical_analysis_trainer.models._paths import package_models_dir
 from technical_analysis_trainer.models.quantile.predict import predict_from_candles
 from technical_analysis_trainer.models.trend.plugin import load_trend_config
@@ -23,13 +35,36 @@ from technical_analysis_trainer.models.trend.predict import (
     build_trend_x_window_from_frames,
 )
 
-CSV = "technical_analysis_trainer/data/btcusdt_1h_train.csv"
+# How far back the tests anchor. Every anchor these tests touch sits within
+# ANCHOR_BACK bars of the end of the file, so all of them postdate the cutoff as
+# long as the holdout has more unseen bars than this.
+ANCHOR_BACK = 62
+_CACHE: dict[str, object] = {}
+
+
+def _holdout():
+    if "holdout" not in _CACHE:
+        _CACHE["holdout"] = ensure_holdout(
+            offline=os.environ.get("HOLDOUT_OFFLINE") == "1", quiet=True
+        )
+    return _CACHE["holdout"]
 
 
 def _load(n: int = 1400) -> pd.DataFrame:
-    df = pd.read_csv(CSV).tail(n).reset_index(drop=True)
+    df = pd.read_csv(_holdout().btc).tail(n).reset_index(drop=True)
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     return df
+
+
+def test_anchors_are_unseen() -> None:
+    """The premise of every other test here: these bars postdate the artifacts."""
+    h = _holdout()
+    df = _load()
+    oldest_anchor = _utc(df["ts"].iloc[len(df) - ANCHOR_BACK])
+    assert oldest_anchor > h.cutoff, (
+        f"oldest anchor {oldest_anchor} is not after the export cutoff {h.cutoff} — "
+        f"the holdout has only {h.unseen_bars()} unseen bars, need > {ANCHOR_BACK}"
+    )
 
 
 def test_trim_removes_future_rows() -> None:
@@ -133,6 +168,36 @@ def test_backfill_and_live_anchors_agree() -> None:
     )
     assert np.array_equal(backfill_x, live_x), "backfill and live windows diverge"
     assert _utc(backfill_meta["last_ts"]) == _utc(live_meta["last_ts"]) == anchor
+
+
+def test_trailing_prior_ignores_future_candles() -> None:
+    """
+    The serving-side base rate must not move when future bars are added.
+
+    The prior-shift correction re-centres probabilities onto the rate of
+    recently *resolved* barrier outcomes. A triple-barrier label is not known
+    until up to `max_holding` bars after its anchor, so a naive rolling mean of
+    labels would read outcomes from the future of the bar it informs — and it
+    would do so invisibly, because the result still looks like a plausible base
+    rate. This pins the property instead: the prior at bar T is identical
+    whether or not the frame contains anything after T.
+    """
+    from technical_analysis_trainer.models.trend.predict import trailing_prior_from_candles
+    from technical_analysis_trainer.models.trend.target import build_target_spec
+
+    df = _load()
+    spec = build_target_spec("triple_barrier", {"upper_mult": 2.5, "lower_mult": 2.5,
+                                                "max_holding": 24, "vol_window": 72})
+    cut = len(df) - 200
+    full = trailing_prior_from_candles(df, spec)
+    trimmed = trailing_prior_from_candles(df.iloc[: cut + 1].reset_index(drop=True), spec)
+    assert full is not None and trimmed is not None, "prior series should be computable"
+    assert np.allclose(full[:cut + 1], trimmed, equal_nan=True), (
+        "trailing prior changed when future candles were present — it is reading "
+        "outcomes it could not have known"
+    )
+    # And it must actually vary, or the test would pass on a constant.
+    assert np.std(full[-2000:]) > 1e-6, "prior is constant; the check would be vacuous"
 
 
 def test_predictions_differ_across_anchors() -> None:

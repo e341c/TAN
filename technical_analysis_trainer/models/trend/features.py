@@ -422,6 +422,9 @@ def build_features_df(
     df: pd.DataFrame,
     mtf_cfg: dict | None = None,
     cross_market_cfg: dict | None = None,
+    order_flow: bool = True,
+    exclude: list[str] | None = None,
+    features_override: list[str] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Построение датафрейма с техническими фичами без масштабирования и окон.
@@ -620,6 +623,49 @@ def build_features_df(
     else:
         funding_features = []
 
+    # ── Order flow: taker buy/sell imbalance ─────────────────────────────────
+    #
+    # Binance returns `taker_buy_base` on every kline and this repo fetched it
+    # and dropped it for years (data_fetch/binance_klines.py kept only
+    # ts/OHLC/volume/trades). It is the closest thing to signed order flow that
+    # exists without a depth collector: taker buys are the aggressive side, so
+    # buy/total says who was crossing the spread inside the bar. Every other
+    # feature here is derived from where price went; this is the only one that
+    # says who pushed it.
+    #
+    # Encoded as an imbalance in [-1, 1] rather than a raw volume so it is
+    # scale-free across regimes, plus rolling means over the same flow windows
+    # as the other volume features, and a z-score for the short window so a
+    # regime of persistent buying does not read as permanently bullish.
+    # Gated by config as well as by the column's presence: 18 rolling monthly
+    # origins could not distinguish the block's effect from zero (mean AUC diff
+    # +0.0092, 95% CI [-0.0138, +0.0323], p=0.43, 10/18 months better), so
+    # whether it earns its six inputs is an open question the flag keeps cheap
+    # to re-test. See plan.txt 6.7.
+    has_taker = order_flow and "taker_buy_base" in df.columns
+    if has_taker:
+        taker_buy = df["taker_buy_base"].astype(float)
+        vol = df["volume"].astype(float)
+        imb = (2.0 * taker_buy - vol) / (vol + eps)
+        df["taker_imbalance"] = imb.clip(-1.0, 1.0)
+        for w in flow_windows:
+            df[f"taker_imbalance_{w}"] = imb.rolling(window=w, min_periods=w).mean()
+        m = imb.rolling(window=flow_windows[0], min_periods=flow_windows[0]).mean()
+        s = imb.rolling(window=flow_windows[0], min_periods=flow_windows[0]).std()
+        df[f"taker_imbalance_z_{flow_windows[0]}"] = (imb - m) / (s + eps)
+        # Flow against price: aggressive buying into a falling bar (and the
+        # reverse) is the absorption/exhaustion pattern the plain imbalance
+        # cannot express on its own.
+        df["taker_flow_vs_return"] = df["taker_imbalance"] * np.sign(df["log_return"].fillna(0.0))
+        taker_features = [
+            "taker_imbalance",
+            *[f"taker_imbalance_{w}" for w in flow_windows],
+            f"taker_imbalance_z_{flow_windows[0]}",
+            "taker_flow_vs_return",
+        ]
+    else:
+        taker_features = []
+
     # ── Временны́е фичи ───────────────────────────────────────────────────────
     if "ts" in df.columns:
         dt = pd.to_datetime(df["ts"])
@@ -661,8 +707,38 @@ def build_features_df(
         *mtf_feature_list,
         *cross_feature_list,
         *funding_features,
+        *taker_features,
         *time_features,
     ]
+
+    # Pruning, by name, from config.
+    #
+    # The columns are still COMPUTED — only the model-input list shrinks. That
+    # keeps `df_feat` usable for diagnostics and keeps the drop reversible
+    # without a data rebuild. The list must match between training and serving:
+    # `add_features` scales with whatever list it builds, so a mismatch raises
+    # "X has N features, but StandardScaler is expecting M" rather than failing
+    # quietly, which is the behaviour we want.
+    if exclude:
+        drop = set(exclude)
+        features = [f for f in features if f not in drop]
+
+    # An artifact's own feature list wins over anything config says.
+    #
+    # At inference the set of inputs is a property of the trained model, not of
+    # a YAML file that can drift away from it — the serving path reads
+    # test_config.yaml while training reads config.yaml, so a pruning change in
+    # one silently disagreed with the other. Passing the scaler bundle's list
+    # here makes the artifact authoritative and turns a mismatch into a named
+    # error instead of a shape error.
+    if features_override is not None:
+        missing = [f for f in features_override if f not in df.columns]
+        if missing:
+            raise ValueError(
+                f"artifact expects {len(missing)} feature(s) this frame cannot build: "
+                f"{', '.join(missing[:8])}{' ...' if len(missing) > 8 else ''}"
+            )
+        features = list(features_override)
 
     return df, features
 
@@ -691,6 +767,56 @@ def resolve_feature_scale_clip(cfg: dict | None) -> tuple[float, float]:
     if v <= 0:
         raise ValueError(f"feature_scale_clip as number must be > 0, got {v}")
     return (-v, v)
+
+
+def barrier_touch_flags(
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    sigma: np.ndarray,
+    upper_mult: float,
+    lower_mult: float,
+    max_holding: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Was each barrier touched AT ALL within the window? Returns (up, dn, observable).
+
+    Deliberately not the same question as `triple_barrier_labels`, which reports
+    which barrier came FIRST and stops looking. Here both are scanned to the end
+    of the holding window, so an anchor can have touched both, either or neither.
+
+    The distinction is the point. "Which first" is direction, and direction is
+    exhausted on this data (plan 19.5). "Either touched" is volatility, and that
+    is strongly predictable (plan 20). One-sided touch sits between them: mostly
+    volatility, but the ASYMMETRY between the two sides is directional, and it is
+    a decomposition nothing in this repo had tried.
+
+    `observable` is False for anchors whose window runs past the end of the data,
+    where a "not touched" is ignorance rather than a measurement — the same trap
+    the resolution label fell into (plan 20.2).
+    """
+    n = len(close)
+    up = np.zeros(n, dtype=bool)
+    dn = np.zeros(n, dtype=bool)
+    observable = np.zeros(n, dtype=bool)
+    for i in range(n):
+        s = sigma[i]
+        if not np.isfinite(s) or s <= 0:
+            continue
+        end = i + max_holding
+        if end >= n:
+            continue
+        observable[i] = True
+        hi = close[i] * np.exp(upper_mult * s)
+        lo = close[i] * np.exp(-lower_mult * s)
+        for j in range(i + 1, end + 1):
+            if high[j] >= hi:
+                up[i] = True
+            if low[j] <= lo:
+                dn[i] = True
+            if up[i] and dn[i]:
+                break
+    return up, dn, observable
 
 
 def triple_barrier_labels(
@@ -800,7 +926,15 @@ def add_features(
     clip_high: float = 5.0,
     target_mode: str = "next_bar",
     tb_cfg: dict | None = None,
+    label_mode: str = "direction",
     return_weights: bool = False,
+    return_index: bool = False,
+    anchor: str = "last_observed",
+    order_flow: bool = True,
+    exclude: list[str] | None = None,
+    features_override: list[str] | None = None,
+    label_autocorr: bool = False,
+    label_autocorr_windows: tuple[int, ...] = (168, 720),
 ):
     """
     Feature engineering pipeline for OHLCV time series (BTCUSDT 1H).
@@ -829,8 +963,27 @@ def add_features(
     if clip_low >= clip_high:
         raise ValueError(f"add_features: clip_low must be < clip_high, got {clip_low=} {clip_high=}")
     df_feat, features = build_features_df(
-        df, mtf_cfg=mtf_cfg, cross_market_cfg=cross_market_cfg
+        df, mtf_cfg=mtf_cfg, cross_market_cfg=cross_market_cfg, order_flow=order_flow,
+        exclude=exclude, features_override=features_override,
     )
+
+    # Position of each df_feat row in the caller's `df`.
+    #
+    # build_features_df ends with a global `dropna().reset_index(drop=True)`, so
+    # df_feat is a filtered, re-indexed subset of `df` — on a one-month span with
+    # this feature set it is ~65% of the input rows, and the dropped ones are not
+    # only the leading warmup. Row i of df_feat is therefore NOT bar i of `df`,
+    # and nothing downstream could recover the mapping. Timestamps survive the
+    # filtering, so they are what we join on.
+    if "ts" in df.columns and "ts" in df_feat.columns:
+        src_pos = (
+            pd.Series(np.arange(len(df)), index=pd.to_datetime(df["ts"], utc=True).to_numpy())
+            .reindex(pd.to_datetime(df_feat["ts"], utc=True).to_numpy())
+            .to_numpy()
+        )
+    else:
+        # No timestamps to join on; positions can only be df_feat-relative.
+        src_pos = np.arange(len(df_feat), dtype=np.int64)
 
     # ── Target ───────────────────────────────────────────────────────────────
     future_return = (df_feat["close"].shift(-horizon) - df_feat["close"]) / df_feat["close"]
@@ -853,12 +1006,97 @@ def add_features(
             lower_mult=float(tb.get("lower_mult", 1.5)),
             max_holding=max_holding,
         )
-        valid_label = labels >= 0
-        uniq = average_uniqueness(spans, valid_label)
-        # Weight = how much the label is worth (realised move) x how much new
-        # information it carries (uniqueness among overlapping labels).
-        raw_w = np.abs(realized) * uniq
+        if label_mode in ("touch_upper", "touch_lower"):
+            # One-sided touch: will THIS barrier be reached inside the window,
+            # whatever the other one does. See barrier_touch_flags.
+            up_hit, dn_hit, observable = barrier_touch_flags(
+                df_feat["close"].to_numpy(dtype=np.float64),
+                df_feat["high"].to_numpy(dtype=np.float64),
+                df_feat["low"].to_numpy(dtype=np.float64),
+                sigma,
+                upper_mult=float(tb.get("upper_mult", 1.5)),
+                lower_mult=float(tb.get("lower_mult", 1.5)),
+                max_holding=max_holding,
+            )
+            labels = (up_hit if label_mode == "touch_upper" else dn_hit).astype(np.int64)
+            valid_label = observable
+            raw_w = average_uniqueness(spans, valid_label)
+        elif label_mode == "resolution":
+            # ── "Will a barrier be touched at all within max_holding?" ────────
+            #
+            # Not a direction target. Direction is exhausted (plan 19.5: five
+            # approaches, all landing at AUC ~0.52), but WHETHER price travels
+            # k*sigma inside the window is a volatility question, and volatility
+            # is the one thing in this repo that demonstrably generalises out of
+            # sample. It is also directly worth money: plan 18.3 showed timeouts
+            # are what sink the wide-barrier geometries, because a timed-out
+            # trade pays the cost and earns nothing.
+            #
+            # Anchors where BOTH barriers were hit in one bar count as touched —
+            # `triple_barrier_labels` marks them -1 because it cannot say which
+            # came first, which is unanswerable for direction and irrelevant
+            # here. They are 0.2-0.5% of anchors.
+            # `spans < max_holding` means "a barrier was hit before the window
+            # ran out" — but ONLY when the window actually got to run. Near the
+            # right edge of a frame `triple_barrier_labels` clips its scan to
+            # `min(i + max_holding, n - 1)`, so an anchor with nowhere left to
+            # look also reports a short span and would be read as touched. The
+            # `label_end >= n_rows` guard below does not catch it, because the
+            # clipped span makes label_end land just inside the frame.
+            #
+            # So the last `max_holding` anchors are excluded outright: their
+            # outcome is not observable, and guessing it is how a target starts
+            # lying. (The direction target is immune — it only ever trusts
+            # `labels >= 0`, which a clipped scan never sets.)
+            full_window = np.arange(n_rows) + max_holding < n_rows
+            touched = (labels >= 0) | (spans < max_holding)
+            labels = touched.astype(np.int64)
+            # Every anchor with a usable sigma and an observable window is now a
+            # sample, including the timeouts the direction target throws away —
+            # that is the point.
+            valid_label = np.isfinite(sigma) & (sigma > 0) & full_window
+            # No magnitude term: the target is an event, not a move, so weighting
+            # by |realised| would just up-weight the volatile half of the label.
+            raw_w = average_uniqueness(spans, valid_label)
+        else:
+            valid_label = labels >= 0
+            uniq = average_uniqueness(spans, valid_label)
+            # Weight = how much the label is worth (realised move) x how much new
+            # information it carries (uniqueness among overlapping labels).
+            raw_w = np.abs(realized) * uniq
         label_end = np.arange(n_rows) + np.maximum(spans, 1)
+
+        # ── Target autocorrelation, as an input ──────────────────────────────
+        #
+        # OFF by default, and the reason is worth keeping. This was added because
+        # the trailing base rate of already-resolved barrier outcomes appeared to
+        # score pooled AUC 0.5802 on its own against the model's 0.5317 — a
+        # one-line baseline beating the ensemble.
+        #
+        # That number was an artifact. rolling_eval read the prior at the wrong
+        # bar: `build_span` returned rows, not bars, and the index it was paired
+        # with ran ~47 bars ahead of the true anchor on average. Read at the
+        # anchor itself the same series scores 0.5066; read 50 bars ahead, 0.5827.
+        # The baseline was seeing the outcome of the label it was predicting.
+        # models/trend/test_spans.py pins the alignment that makes this checkable.
+        #
+        # Re-run as a clean A/B over 36 monthly origins the feature is worth
+        # nothing: AUC -0.0025, 95% CI [-0.0170, +0.0119], p = 0.73, 15/36.
+        # Kept behind the flag so the retest stays cheap, not because it works.
+        #
+        # The construction itself is sound: each label is credited to the bar it
+        # RESOLVES on, never its anchor, so the value at bar t uses only outcomes
+        # a live system would have had at t.
+        if label_autocorr:
+            from technical_analysis_trainer.core.calibration import trailing_prior
+
+            for w in label_autocorr_windows:
+                col = f"label_base_rate_{w}"
+                df_feat[col] = trailing_prior(
+                    labels, label_end, n_rows, window=int(w), min_count=50, fallback=0.5
+                )
+                if col not in features:
+                    features.append(col)
     else:
         labels = np.where(
             future_return.to_numpy() > threshold,
@@ -869,6 +1107,21 @@ def add_features(
         # A 0.02% bar and a 2% bar are not equally informative; weight by size.
         raw_w = np.abs(future_return.to_numpy())
         label_end = np.arange(n_rows) + horizon
+
+    # The label-autocorrelation columns are appended after build_features_df has
+    # already applied `exclude` and `features_override`, so re-apply both to the
+    # extended list. Without this an artifact's own feature list would be
+    # silently overridden by whatever the config asked for.
+    if exclude:
+        features = [f for f in features if f not in set(exclude)]
+    if features_override is not None:
+        missing = [f for f in features_override if f not in df_feat.columns]
+        if missing:
+            raise ValueError(
+                f"artifact expects {len(missing)} feature(s) this frame cannot build: "
+                f"{', '.join(missing[:8])}{' ...' if len(missing) > 8 else ''}"
+            )
+        features = list(features_override)
 
     # ── Масштабирование ───────────────────────────────────────────────────────
     X_raw = df_feat[features].values
@@ -882,7 +1135,22 @@ def add_features(
     X_raw = np.clip(X_raw, clip_low, clip_high)
 
     # ── Построение последовательностей ───────────────────────────────────────
-    X, Y, W = [], [], []
+    #
+    # `anchor` decides which bars the window covers relative to the label at i.
+    # The label's barriers start at close[i] and the path is scanned from i+1.
+    #
+    #   last_observed  window = [i-seq_len+1 .. i]  — bar i is INSIDE the window,
+    #                  so the model sees the close its barriers are measured from.
+    #   next_close     window = [i-seq_len .. i-1]  — the original convention, in
+    #                  which close[i] is one bar in the model's future. On BTC 1h
+    #                  that unobserved bar is ~44% of the barrier half-width, i.e.
+    #                  a large slice of the target is noise by construction, and
+    #                  live the anchor bar has not even closed yet.
+    #
+    # Both keep the same loop bounds so the two conventions yield the same number
+    # of samples and differ only in which bars each window covers.
+    shift = 1 if anchor == "last_observed" else 0
+    X, Y, W, I = [], [], [], []
     for i in range(seq_len, n_rows):
         if not valid_label[i] or not np.isfinite(raw_w[i]):
             continue
@@ -890,13 +1158,14 @@ def add_features(
         if label_end[i] >= n_rows:
             continue
 
-        window = X_raw[i - seq_len : i]
+        window = X_raw[i - seq_len + shift : i + shift]
         if np.isnan(window).any():
             continue
 
         X.append(window)
         Y.append(int(labels[i]))
         W.append(float(raw_w[i]))
+        I.append(i)
 
     weights = np.array(W, dtype=np.float32)
     if len(weights) and weights.sum() > 0:
@@ -914,6 +1183,17 @@ def add_features(
     # and must keep getting df_feat as the last element.
     if return_weights:
         out = out + (weights,)
+    # `index` is the position in the caller's `df` of each window's anchor bar.
+    #
+    # Two separate filters stand between `df` and these rows: build_features_df
+    # drops rows and re-indexes (see src_pos above), and the loop here skips
+    # anchors whose label is unresolved, whose label resolves past the end of the
+    # frame, or whose window still holds a warmup NaN. Together they keep roughly
+    # half the input bars, non-contiguously. A caller lining these rows up
+    # against anything indexed by bar — a per-bar prior, a timestamp, a split
+    # boundary — cannot infer that mapping from the row count, so it is returned.
+    if return_index:
+        out = out + (src_pos[np.array(I, dtype=np.int64)] if I else np.empty(0, np.int64),)
     if return_df_feat:
         return out + (df_feat,)
     return out

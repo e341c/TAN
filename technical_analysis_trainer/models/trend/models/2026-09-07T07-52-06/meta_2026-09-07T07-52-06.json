@@ -1,0 +1,125 @@
+{
+  "version": "2026-09-07T07-52-06",
+  "seq_len": 24,
+  "n_features": 52,
+  "features": [
+    "open_ratio",
+    "high_ratio",
+    "low_ratio",
+    "price_roc",
+    "log_return",
+    "volume_norm",
+    "vol_z_24",
+    "vol_z_72",
+    "vol_z_168",
+    "amihud_24",
+    "amihud_72",
+    "amihud_168",
+    "range_per_vol_24",
+    "range_per_vol_72",
+    "range_per_vol_168",
+    "avg_trade_size_24",
+    "avg_trade_size_72",
+    "avg_trade_size_168",
+    "rsi_scaled",
+    "atr_norm",
+    "score_norm",
+    "roc_3",
+    "roc_6",
+    "roc_12",
+    "macd_hist_norm",
+    "bb_position",
+    "body_ratio",
+    "atr_ratio",
+    "dist_from_high",
+    "dist_from_low",
+    "mtf_4h_rsi_14",
+    "mtf_4h_ret_14",
+    "mtf_4h_rv_14",
+    "mtf_4h_dist_vwap_14",
+    "mtf_1d_rsi_14",
+    "mtf_1d_ret_14",
+    "mtf_1d_rv_14",
+    "mtf_1d_dist_vwap_14",
+    "xmkt_log_ret_eth",
+    "xmkt_log_ret_sol",
+    "xmkt_log_ret_dxy",
+    "xmkt_log_ret_risk_proxy",
+    "xmkt_log_ret_main_minus_eth",
+    "xmkt_corr_main_eth_24",
+    "xmkt_corr_main_eth_72",
+    "xmkt_corr_main_eth_168",
+    "funding_rate_scaled",
+    "funding_rate_cum3",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos"
+  ],
+  "dynamic_batch": true,
+  "opset": 18,
+  "provenance": {
+    "trained_on": "technical_analysis_trainer/data/train/btcusdt_1h.csv",
+    "frozen_eval_start": "2026-08-01 00:00:00+00:00",
+    "train_end_ts": "2026-03-12 23:00:00+00:00",
+    "calibration_start_ts": "2026-03-14 23:00:00+00:00",
+    "data_end_ts": "2026-07-31 23:00:00+00:00",
+    "n_train": 33941,
+    "n_cal": 2867,
+    "epoch_budget": 3,
+    "embargo": 48,
+    "target_spec": {
+      "mode": "triple_barrier",
+      "upper_mult": 2.5,
+      "lower_mult": 2.5,
+      "max_holding": 24,
+      "vol_window": 72,
+      "horizon_bars": 24,
+      "horizon_hours": 24.0,
+      "anchor": "last_observed",
+      "description": "P(price touches +2.5*sigma before -2.5*sigma within 24 bars, from the last observed close)"
+    },
+    "calibrator": {
+      "kind": "platt",
+      "a": 0.5594962607585399,
+      "b": -0.1139379712330128,
+      "n": 2867,
+      "threshold": 0.5100000000000002
+    },
+    "cal_auc": 0.6008581620420456,
+    "cal_brier_raw": 0.24328216838455838,
+    "cal_brier": 0.2427456868909075
+  },
+  "eval": {
+    "n_folds": 3,
+    "auc_val_mean": 0.5511846921012028,
+    "auc_ens_mean": 0.5564082576534913,
+    "acc_ens_mean": 0.5367138316040235,
+    "majority_mean": 0.5056207273761057,
+    "per_fold_auc_val": [
+      0.5424844248598676,
+      0.5608458763592754,
+      0.5502237750844652
+    ],
+    "per_fold_auc_ens": [
+      0.5486571969393881,
+      0.5515912891051836,
+      0.5689762869159024
+    ],
+    "per_fold_acc_ci95": [
+      [
+        0.5029585798816568,
+        0.5724852071005917
+      ],
+      [
+        0.5039456781060745,
+        0.57038906221325
+      ],
+      [
+        0.5007191657677095,
+        0.5693994965839626
+      ]
+    ],
+    "note": "The shipped model is a refit on the full permitted span and has no test set of its own. These walk-forward numbers are its performance estimate."
+  }
+}

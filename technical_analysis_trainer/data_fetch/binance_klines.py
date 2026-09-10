@@ -54,10 +54,16 @@ def fetch_klines(symbol: str, interval: str, months: int) -> pd.DataFrame:
             "ignore",
         ],
     )
-    df = df[["ts", "open", "high", "low", "close", "volume", "trades"]]
+    # taker_buy_base is kept, not dropped. It is the aggressive (spread-crossing)
+    # share of the bar's volume — the only signed order-flow information Binance
+    # hands out for free with klines — and it arrived in every response here for
+    # years while this line threw it away. See features.build_features_df for
+    # what is built from it.
+    df = df[["ts", "open", "high", "low", "close", "volume", "trades", "taker_buy_base"]]
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     return df.astype(
-        {"open": float, "high": float, "low": float, "close": float, "volume": float, "trades": int}
+        {"open": float, "high": float, "low": float, "close": float, "volume": float,
+         "trades": int, "taker_buy_base": float}
     ).drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
 
 

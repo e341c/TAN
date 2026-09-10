@@ -13,6 +13,7 @@ def export_model(
     horizon,
     save_state_dict: bool = True,
     batch_size: int = 8,
+    provenance: dict | None = None,
 ):
     """
     Export to ONNX with a dynamic batch axis.
@@ -74,6 +75,11 @@ def export_model(
                     "features": list(features),
                     "dynamic_batch": True,
                     "opset": 18,
+                    # What this artifact was allowed to see. Without it the only
+                    # durable record of a model's training span is its export
+                    # stamp, which bounds the answer but does not give it — and
+                    # every "out-of-sample" claim depends on knowing it exactly.
+                    "provenance": _jsonable(provenance or {}),
                     "eval": _jsonable(eval_results),
                 },
                 f,

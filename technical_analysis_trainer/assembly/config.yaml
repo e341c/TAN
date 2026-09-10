@@ -1,3 +1,12 @@
+# ── Граница обучение / оценка ────────────────────────────────────────────────
+# Строки с этого момента (UTC) недоступны обучению: это замороженный тестовый
+# набор. core/protocol.py читает эту дату и роняет тренировку, если данные её
+# перешагнули, — раньше «out-of-sample» выводился из индексов walk-forward
+# сплита и уезжал при каждом росте CSV.
+# Дата фиксированная, а не «последние N дней»: иначе каждый рефетч потихоньку
+# отдавал бы обучению кусок того, что мы собирались измерять.
+frozen_eval_start: "2026-08-01T00:00:00Z"
+
 enabled_models:
   - quantile
   - trend
@@ -17,5 +26,24 @@ defaults:
   # raw mtf_*_vwap_* price levels that were dropped for being non-stationary.
   # Pinned explicitly: left null, the trend plugin serves whichever run has the
   # newest scaler file, so any training run silently changes production.
-  trend_run: "2026-08-17T15-47-17"
+  #
+  # Chosen by `python -m technical_analysis_trainer.models.trend.select_run`,
+  # which reads auc_val and refuses to look at a test column. The pin before
+  # that (2026-08-17T15-47-17) was the argmax of twelve test scores and sat
+  # within a whisker of where the best of twelve noise draws is expected.
+  #
+  # 2026-09-09: moved off 2026-09-07T11-29-30. That run is not worse — it is
+  # UNMEASURABLE. Every run logged before 2026-09-08 was scored by a build_span
+  # that trimmed by row count instead of by bar, so its validation window began
+  # ~200 bars inside its own training data and its auc_val is inflated by an
+  # unknown amount (plan.txt 16). select_run now refuses to rank across that
+  # break and this is the only run on the current harness.
+  #
+  # It also matches the config the repo now carries: prior_shift and
+  # label_autocorr are both off, and the old pin has prior_shift baked into its
+  # bundle, so serving was applying a correction the config had already retired.
+  #
+  # This is a default, not a demonstrated winner — select_run says so. To go
+  # back, restore the string below; nothing else depends on it.
+  trend_run: "2026-09-08T09-00-28"
 trend_config_path: technical_analysis_trainer/models/trend/test_config.yaml

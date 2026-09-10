@@ -19,6 +19,20 @@ data:
   # обучением. Подменять на test_config.yaml не нужно: там те же блоки, но
   # пути ведут на укороченные predict-CSV.
   trend_config: technical_analysis_trainer/models/trend/config.yaml
+  # Опционально: перебить ПУТИ к бенчмаркам/макро из trend_config. Окна,
+  # tolerance и набор фич при этом не меняются — иначе модель считалась бы по
+  # входам, которых она не видела при обучении. Так holdout_eval.py подставляет
+  # свежие CSV из data/holdout/ вместо обучающих.
+  # eth: technical_analysis_trainer/data/holdout/ethusdt_1h.csv
+  # sol: technical_analysis_trainer/data/holdout/solusdt_1h.csv
+  # dxy: technical_analysis_trainer/data/holdout/macro_dtwexbgs_1d.csv
+  # risk_proxy: technical_analysis_trainer/data/holdout/macro_vixcls_1d.csv
+
+# Жёсткая граница out-of-sample: свечи позже этого момента заведомо не попадали
+# в обучение (это метка экспорта артефакта). null → граница оценивается
+# пересчётом walk-forward сплита, что менее надёжно. Ставится автоматически,
+# когда бэктест запускается из holdout_eval.py.
+unseen_from: null
 
 range:
   # Сколько последних свечей взять. start/end, если заданы, имеют приоритет.

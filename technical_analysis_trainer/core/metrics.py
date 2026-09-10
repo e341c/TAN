@@ -43,6 +43,67 @@ def bootstrap_ci(
     return (float(lo), float(hi))
 
 
+def effective_n(spans, valid=None) -> float:
+    """
+    Independent-observation count behind a set of overlapping labels.
+
+    Triple-barrier labels share their outcome path: a label with a 6-bar span
+    overlaps the next five. Counting them as independent makes every CI too
+    narrow and every significance test too easy to pass. Average uniqueness
+    (Lopez de Prado) is the fraction of each label's life it does not share, so
+    its sum is the effective sample size.
+
+    Measured on the 2026-08 trend holdout: 389 resolved anchors, mean uniqueness
+    0.195, effective n ~ 76. Reporting 389 there overstates precision by ~2.3x.
+    """
+    from technical_analysis_trainer.models.trend.features import average_uniqueness
+
+    s = np.asarray(spans, dtype=np.int64).ravel()
+    v = np.ones(len(s), dtype=bool) if valid is None else np.asarray(valid, dtype=bool).ravel()
+    if len(s) == 0:
+        return 0.0
+    return float(average_uniqueness(s, v)[v].sum())
+
+
+def block_bootstrap_ci(
+    values,
+    block: int,
+    stat=np.mean,
+    n_boot: int = 2000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """
+    Percentile CI that resamples contiguous blocks instead of single points.
+
+    `bootstrap_ci` assumes independence. For anything indexed by time here —
+    triple-barrier accuracy, interval coverage, direction hit rate — neighbouring
+    samples share both their label path and their market regime, so the i.i.d.
+    resample produces an interval that is roughly sqrt(1/uniqueness) too narrow.
+
+    Resampling blocks of `block` consecutive observations keeps that local
+    dependence intact. Set `block` to the label's maximum span (max_holding for
+    triple barrier, the horizon otherwise); a block shorter than the overlap
+    still understates the width.
+    """
+    v = np.asarray(values, dtype=np.float64).ravel()
+    n = len(v)
+    if n == 0:
+        return (float("nan"), float("nan"))
+    b = max(1, min(int(block), n))
+    n_blocks = int(np.ceil(n / b))
+    rng = np.random.default_rng(seed)
+    # Moving-block bootstrap: draw block start positions, concatenate, trim to n.
+    starts = rng.integers(0, n - b + 1, size=(n_boot, n_blocks))
+    offsets = np.arange(b)
+    stats = np.empty(n_boot, dtype=np.float64)
+    for k in range(n_boot):
+        idx = (starts[k][:, None] + offsets).ravel()[:n]
+        stats[k] = stat(v[idx])
+    lo, hi = np.percentile(stats, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return (float(lo), float(hi))
+
+
 def har_rv_forecast(
     log_returns,
     windows: tuple[int, int, int] = (1, 24, 168),

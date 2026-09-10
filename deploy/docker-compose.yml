@@ -142,7 +142,19 @@ services:
     volumes:
       - ../technical_analysis_trainer/models/quantile/models:/app/technical_analysis_trainer/models/quantile/models:ro
       - ../technical_analysis_trainer/models/trend/models:/app/technical_analysis_trainer/models/trend/models:ro
-      - ../technical_analysis_trainer/data:/app/technical_analysis_trainer/data:ro
+      # NOT read-only, unlike the api service. The scheduler is the process that
+      # MAINTAINS this directory: macro_fred writes data/train and data/predict,
+      # and binance_derivatives writes data/derivatives. Mounted `:ro` — as it
+      # was until 2026-09-09 — every one of those cron jobs fails on write, into
+      # a log nobody reads, which is precisely the silent-staleness failure the
+      # crontab's own comment describes ("this is exactly how two of the 54
+      # features went dead in production"). The fetch jobs were added to fix that
+      # and could not have worked.
+      #
+      # The derivatives series make this worse than stale data: Binance keeps 30
+      # days and refuses older startTime, so a failed write is not recoverable by
+      # running it again later.
+      - ../technical_analysis_trainer/data:/app/technical_analysis_trainer/data
       - scheduler_logs:/var/log
     command: ["/usr/local/bin/supercronic", "/etc/crontab"]
     depends_on:
@@ -150,6 +162,25 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+    networks:
+      - tan_net
+
+  # Liquidations are a DAEMON, not a cron job: /fapi/v1/allForceOrders is 404 and
+  # the websocket remembers nothing, so anything that happens while this is down
+  # is gone. Unlike the 30-day REST series it cannot be caught up at all.
+  liquidations:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.api
+    image: ${TAN_API_IMAGE:-tan-api:local}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+    volumes:
+      - ../technical_analysis_trainer/data:/app/technical_analysis_trainer/data
+    command: ["python", "-m", "technical_analysis_trainer.data_fetch.binance_liquidations", "--run"]
     networks:
       - tan_net
 

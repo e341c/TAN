@@ -1,5 +1,14 @@
 /venv
-/data
+# Data is ignored by default — the OHLCV and macro CSVs are large, and every one
+# of them can be re-fetched from Binance or FRED at any time.
+#
+# data/derivatives is the exception and is tracked deliberately. Binance keeps
+# only 30 days of /futures/data/* and rejects an older startTime, so those rows
+# exist nowhere else the moment they age out. Losing the working copy would mean
+# losing the history permanently, which is not a risk worth taking to save
+# ~1.2 MB a year. See data_fetch/binance_derivatives.py.
+/data/*
+!/data/derivatives/
 /__pycache__
 **/__pycache__/
 *.pyc

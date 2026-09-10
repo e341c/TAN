@@ -1,0 +1,117 @@
+{
+  "version": "2026-09-07T11-29-30",
+  "seq_len": 24,
+  "n_features": 42,
+  "features": [
+    "open_ratio",
+    "low_ratio",
+    "log_return",
+    "volume_norm",
+    "vol_z_24",
+    "vol_z_72",
+    "vol_z_168",
+    "amihud_24",
+    "amihud_72",
+    "amihud_168",
+    "range_per_vol_24",
+    "range_per_vol_72",
+    "range_per_vol_168",
+    "avg_trade_size_24",
+    "avg_trade_size_72",
+    "avg_trade_size_168",
+    "rsi_scaled",
+    "atr_norm",
+    "score_norm",
+    "bb_position",
+    "body_ratio",
+    "mtf_1d_rsi_14",
+    "mtf_1d_ret_14",
+    "mtf_1d_rv_14",
+    "mtf_1d_dist_vwap_14",
+    "xmkt_log_ret_eth",
+    "xmkt_log_ret_sol",
+    "xmkt_log_ret_dxy",
+    "xmkt_log_ret_risk_proxy",
+    "xmkt_log_ret_main_minus_eth",
+    "funding_rate_scaled",
+    "funding_rate_cum3",
+    "taker_imbalance",
+    "taker_imbalance_24",
+    "taker_imbalance_72",
+    "taker_imbalance_168",
+    "taker_imbalance_z_24",
+    "taker_flow_vs_return",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos"
+  ],
+  "dynamic_batch": true,
+  "opset": 18,
+  "provenance": {
+    "trained_on": "technical_analysis_trainer/data/train/btcusdt_1h.csv",
+    "frozen_eval_start": "2026-08-01 00:00:00+00:00",
+    "train_end_ts": "2026-03-12 23:00:00+00:00",
+    "calibration_start_ts": "2026-03-14 23:00:00+00:00",
+    "data_end_ts": "2026-07-31 23:00:00+00:00",
+    "n_train": 33941,
+    "n_cal": 2867,
+    "epoch_budget": 3,
+    "embargo": 48,
+    "target_spec": {
+      "mode": "triple_barrier",
+      "upper_mult": 2.5,
+      "lower_mult": 2.5,
+      "max_holding": 24,
+      "vol_window": 72,
+      "horizon_bars": 24,
+      "horizon_hours": 24.0,
+      "anchor": "last_observed",
+      "description": "P(price touches +2.5*sigma before -2.5*sigma within 24 bars, from the last observed close)"
+    },
+    "calibrator": {
+      "kind": "platt",
+      "a": 0.4861378228451076,
+      "b": -0.07817465645818157,
+      "n": 2867,
+      "threshold": 0.5250000000000001,
+      "prior_ref": 0.5186606208580398,
+      "prior_shift": true
+    },
+    "cal_auc": 0.5745616599904486,
+    "cal_brier_raw": 0.24782410718939443,
+    "cal_brier": 0.2461183068942043
+  },
+  "eval": {
+    "n_folds": 3,
+    "auc_val_mean": 0.5542915488649843,
+    "auc_ens_mean": 0.5620047180323188,
+    "acc_ens_mean": 0.5410556743049589,
+    "majority_mean": 0.5056207273761057,
+    "per_fold_auc_val": [
+      0.537154696556358,
+      0.5613351117381726,
+      0.5643848383004224
+    ],
+    "per_fold_auc_ens": [
+      0.5574623855522441,
+      0.5598973722610034,
+      0.5686543962837087
+    ],
+    "per_fold_acc_ci95": [
+      [
+        0.5219951923076923,
+        0.5885724852071006
+      ],
+      [
+        0.49293448339144796,
+        0.5599192512387594
+      ],
+      [
+        0.5107874865156419,
+        0.5740740740740741
+      ]
+    ],
+    "note": "The shipped model is a refit on the full permitted span and has no test set of its own. These walk-forward numbers are its performance estimate."
+  }
+}

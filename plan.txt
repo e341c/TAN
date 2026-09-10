@@ -1,0 +1,1989 @@
+================================================================================
+TREND MODEL — IMPROVEMENT PLAN
+================================================================================
+Written 2026-09-07.  Phases 1-2 executed the same day — see section 13 for what
+was done, what it changed, and the one conclusion that changed with it.
+Subject: technical_analysis_trainer/models/trend, deployed run 2026-08-17T15-47-17.
+Baseline this plan is measured against: the holdout evaluation added on 2026-09-07
+(technical_analysis_trainer/apps/holdout_eval.py).
+
+--------------------------------------------------------------------------------
+0. ONE-PARAGRAPH SUMMARY
+--------------------------------------------------------------------------------
+The trend model shows no measurable edge on data it has not seen. That statement
+is weaker than "it is worse than a coin flip" and the difference matters: the
+holdout AUC point estimate is 0.4794, but with 389 heavily-overlapping labels the
+effective sample is ~76 independent observations, and the confidence interval
+comfortably contains 0.5. We cannot currently tell a broken model from a working
+one at this sample size. Before any modelling work, three things are wrong that
+have nothing to do with features or architecture: the deployed weights were fitted
+on data ending 2025-05-02 (16 months stale), the deployed run is the argmax of 12
+logged runs ranked by a test-side metric, and the reported confidence intervals
+treat overlapping labels as independent. Fix the measurement and the deployment
+protocol first (Tier 0-1); they are cheap, they are provably wrong today, and
+every later experiment is unreadable without them.
+
+--------------------------------------------------------------------------------
+1. EVIDENCE BASE
+--------------------------------------------------------------------------------
+Everything below was measured on 2026-09-07, not assumed. Reproduce with the
+commands in section 9.
+
+1.1 Holdout performance (495 unseen bars, 2026-08-17 15:47 -> 2026-09-07 06:00)
+    anchors                471
+    resolved               389   (82 unresolved = 17.4%)
+    accuracy               48.07%   (naive 95% CI 43.19-53.21%)
+    ROC-AUC                0.4794   (naive 95% CI 0.4226-0.5385)
+    majority baseline      61.18%
+    edge vs majority       -13.11 pp
+    predicted DOWN         62.98%   vs actual DOWN 38.82%
+    top-decile accuracy    44.74%   (n=38)
+
+    -> The AUC CI contains 0.5. The honest reading is "no detectable edge",
+       not "negative edge". Section 1.5 shows even this CI is too narrow.
+
+1.2 What meta.json claims for the same artifact (fold 2 test window)
+    auc_val        0.5512      <- the number selection is supposed to use
+    auc_ens        0.5855
+    acc_ens        0.5540      (majority 0.5060)
+    auc_gb         0.4876
+    auc_blend      0.5638
+    seed AUCs      0.5711 0.5732 0.5819 0.5806 0.5710
+    top_decile     0.5980
+    n_test         4957
+
+    The gap 0.5855 -> 0.4794 is the entire subject of this document.
+
+1.3 The deployed model is 16 months stale
+    train_v2.py:280 exports `folds[-1]`. With n=37439 rows, n_folds=3,
+    val_ratio=test_ratio=0.15, embargo=48, the folds are:
+
+      fold 0: train 2022-05-10..2024-01-20  val 2024-01-22..2024-09-12  test 2024-09-14..2025-05-06
+      fold 1: train 2022-05-10..2024-09-10  val 2024-09-12..2025-05-04  test 2025-05-06..2025-12-26
+      fold 2: train 2022-05-10..2025-05-02  val 2025-05-04..2025-12-24  test 2025-12-26..2026-08-17
+
+    folds[-1] = fold 2. So the shipped weights AND the shipped StandardScaler
+    were fitted on data ending 2025-05-02. As of today that is 16 months of
+    market the deployed artifact has never been trained on. The last 30% of the
+    available history is spent on validation and test and then thrown away.
+
+1.4 The deployed run is the maximum of the run log
+    train_runs_v2.csv holds 12 runs. auc_ens (a TEST-side metric) has
+    mean 0.5243, std 0.0204. expected_max_of_noise(0.5243, 0.0204, 12) = 0.5534.
+    The observed best is 0.5586 — and that best run, 2026-08-17T15-47-17, is
+    the one pinned in assembly/config.yaml as production.
+
+    This is the exact failure core/validation.py was written to prevent, now
+    reproduced at the run level instead of the seed level. The 184-run analysis
+    quoted in the README ("best run sits exactly where the max of 184 noise
+    draws lands") applies verbatim to the new 12-run log.
+
+1.5 The confidence intervals are too narrow — labels overlap heavily
+    mean average_uniqueness over the holdout = 0.195
+    -> 389 resolved anchors carry roughly 76 independent observations.
+    median span = 6 bars, mean 6.9 (max_holding = 24)
+
+    apps/backtest.py:442 and core/metrics.bootstrap_ci resample anchors i.i.d.
+    With uniqueness 0.195 the true CI is roughly sqrt(1/0.195) = 2.3x wider than
+    reported. Every accuracy CI printed anywhere in this repo for a triple-barrier
+    model is overconfident by about that factor.
+
+    Note also: median span 6 means the "24h barrier" label typically resolves in
+    ~7 hours. The config comment describing it as a day-long aggregate is wrong
+    in practice, and the mapping to a trade (a 24h hold) does not match the label.
+
+1.6 The model is badly calibrated against the current base rate
+    mean p_up = 0.481   actual UP rate = 0.612   calibration gap = +0.131
+    p_up range = 0.326 .. 0.656 (median 0.481) — not collapsed, but narrow.
+
+    Reliability by quintile on the holdout:
+      p in (0.325,0.415]  n=78  mean p=0.384  actual UP=0.692
+      p in (0.415,0.468]  n=78  mean p=0.445  actual UP=0.615
+      p in (0.468,0.498]  n=77  mean p=0.482  actual UP=0.545
+      p in (0.498,0.527]  n=78  mean p=0.510  actual UP=0.551
+      p in (0.527,0.656]  n=78  mean p=0.583  actual UP=0.654
+
+    The curve is U-shaped, not monotone: the least-confident-UP bucket has the
+    HIGHEST realized UP rate. That non-monotonicity is what pushes AUC below 0.5.
+    At n=78 per bucket this is not conclusive on its own, but it is consistent
+    with a model whose operating point has drifted rather than one that ranks well.
+
+1.7 The class prior moved, and training never saw the new one
+    Triple-barrier UP share by quarter (resolved labels only):
+      2022Q2 47.0  2022Q3 49.6  2022Q4 44.9  2023Q1 56.2  2023Q2 51.4  2023Q3 44.8
+      2023Q4 56.1  2024Q1 52.6  2024Q2 49.1  2024Q3 48.6  2024Q4 53.9  2025Q1 49.0
+      2025Q2 52.2  2025Q3 50.4  2025Q4 49.8  2026Q1 44.3  2026Q2 50.6  2026Q3 59.8
+
+    fold-2 training span (..2025-05-02): UP = 50.6%
+    holdout window (2026-08-17..):        UP = 62.7%
+
+    class_weight: auto rebalances to the TRAINING prior, which was ~50/50. The
+    serving prior is ~62/38. Nothing in the pipeline adapts to that.
+
+1.8 Feature drift is real but moderate
+    Mean shift of each feature in the holdout vs the frozen scaler's fitted
+    distribution, in training standard deviations:
+      mtf_1d_rsi_14          +1.42
+      mtf_1d_ret_14          +1.30
+      mtf_1d_dist_vwap_14    +0.96
+      range_per_vol_168      +0.82
+      mtf_4h_rsi_14          +0.78
+      amihud_168             +0.60
+      mtf_4h_ret_14          +0.59
+    5 of 52 features shift more than 0.75 sd. None reach the +-4 clip.
+    No dead (constant-in-training) features in this run.
+
+    Verdict: drift contributes but does not by itself explain the result. The
+    daily-timeframe momentum block is the drifting part, which is expected — a
+    14-day RSI in a strong uptrend is genuinely elevated.
+
+1.9 The barrier is anchored on a price the model cannot see
+    features.add_features pairs window X[i-seq_len:i] (bars up to i-1) with
+    labels[i], and triple_barrier_labels anchors the barriers at close[i] and
+    scans from i+1. So the model predicts a race between close[i]*exp(+2.5s)
+    and close[i]*exp(-2.5s) without observing close[i].
+
+    Measured on the holdout window:
+      1-bar log-return sd            0.00499
+      barrier half-width (2.5*sigma) 0.01136
+      unobserved move / barrier      43.9%
+
+    Nearly half the barrier width is consumed by a single bar the model never
+    sees. At serving time this is worse than untidy: the last closed bar is T,
+    so the window corresponds to i-1 = T, and the barrier belongs to close[T+1],
+    a bar that has not happened. Any consumer placing real stops has to
+    substitute the current price, which is a different level than the label used.
+
+1.10 Sample weighting is extremely concentrated
+    raw_w = |realized| * average_uniqueness, normalised to mean 1:
+      median 0.625   max 23.06   top 10% of samples carry 39.1% of total weight
+    Effective training sample size is far below the nominal 22389 rows.
+
+1.11 The GBM baseline is NOT degenerate (a hypothesis I checked and rejected)
+    train_runs_v2.csv shows auc_gb = 0.49999966 for the last three runs, which
+    looks like a constant predictor. It is not: refitting fold 2 gives
+    AUC 0.4871 with p in 0.241..0.806 and 3852 distinct values. The 0.4999 in the
+    log is the 3-fold MEAN, which happens to land near 0.5. The real finding is
+    duller: GBM on the last bar of the window is at or below chance on fold 2,
+    so blending it 50/50 (train_v2.py:175) drags the ensemble down
+    (auc_blend 0.5638 < auc_ens 0.5855). The blend should not be a headline.
+
+--------------------------------------------------------------------------------
+2. ROOT CAUSES, RANKED BY EXPECTED IMPACT
+--------------------------------------------------------------------------------
+A. We cannot measure a 0.53-AUC edge with the data we test on. (Section 3.1)
+   Power analysis, using the measured bootstrap SE of 0.029 at n=389 and
+   correcting for uniqueness 0.195:
+     to distinguish AUC 0.53 from 0.5:  ~1400 independent labels = ~7200 anchors = ~10 months
+     to distinguish AUC 0.55 from 0.5:  ~ 500 independent labels = ~2600 anchors = ~3.5 months
+     to distinguish AUC 0.58 from 0.5:  ~ 200 independent labels = ~1000 anchors = ~1.4 months
+   A three-week holdout can only detect an edge far larger than any this model
+   has ever claimed. Until the measurement is fixed, every experiment below is
+   a coin flip dressed as a result.
+
+B. Deployment ships a stale, unselected artifact. (1.3, 1.4)
+   Sixteen months of unseen regime, plus run-level selection on a test metric.
+   These are protocol bugs with known fixes and no research risk.
+
+C. The target does not match either the model's information set or the trade. (1.5, 1.9)
+   Barrier anchored on an unobserved bar; median resolution 6 bars against a
+   24-bar nominal horizon; label overlap of 5:1 that nothing downstream accounts for.
+
+D. No calibration or prior adaptation. (1.6, 1.7)
+   The decision threshold is hardcoded at 0.5 and the training prior is frozen.
+
+E. Feature set is momentum-heavy and drifts; no order-flow or positioning data. (1.8, Tier 3)
+   52 features, all derived from OHLCV + 2 crypto benchmarks + 2 daily macro
+   series. Nothing about the order book, liquidations, basis, or realised flow.
+
+F. Architecture is probably not the bottleneck.
+   Listed last deliberately. The 184-run log showed zero hyperparameter
+   correlation, seed std 0.005, and GBM within noise of the LSTM. Changing the
+   model class before fixing A-D will produce another unreadable number.
+
+--------------------------------------------------------------------------------
+3. TIER 0 — MEASUREMENT (do this first; nothing else is interpretable without it)
+--------------------------------------------------------------------------------
+
+3.1 Block-bootstrap confidence intervals that respect label overlap
+    Problem: core/metrics.bootstrap_ci resamples i.i.d.; triple-barrier labels
+    have uniqueness 0.195.
+    Change: add `block_bootstrap_ci(values, spans, n_boot=4000)` to
+    core/metrics.py that resamples contiguous blocks of length >= max_holding,
+    or weights the resample by uniqueness. Use it in apps/backtest.py:442,
+    apps/holdout_eval.py, and train_v2.run_fold.
+    Also print effective sample size (sum of average_uniqueness) next to every n.
+    Acceptance: the holdout accuracy CI widens from 43.2-53.2% to roughly
+    38-58%; the report states n=389 (n_eff~76).
+    Effort: 0.5 day. Risk: none. Value: every future comparison becomes honest.
+
+3.2 A purged, embargoed rolling-origin backtest instead of one holdout window
+    Problem: the current holdout is 3 weeks. Section A shows that is 10x too
+    short to resolve the edge being claimed.
+    Change: add `apps/rolling_eval.py`. For each month M from 2024-01 to now,
+    train on [start, M - embargo], evaluate on M. Report the distribution of
+    monthly AUC/accuracy, not a single number. This is expensive (about 30
+    training runs) but it is the only way to see whether an edge is stable
+    across regimes or is one lucky quarter.
+    Cheaper interim version: keep the model fixed and evaluate the DEPLOYED
+    artifact month by month over its true out-of-sample period (2026-01 onward,
+    from fold 2's test window plus the holdout). That needs no retraining and
+    gives ~8 monthly points immediately.
+    Acceptance: a table of monthly AUC with n_eff per month, and a
+    pooled estimate with a block-bootstrap CI.
+    Effort: 1 day for the fixed-model version, 3 days for the retraining version.
+
+3.3 Make the run log record validation metrics, and stop selecting on test
+    Problem: train_runs_v2.csv records auc_ens/auc_gb/auc_blend/acc_ens — all
+    TEST-side. There is no val column, so nobody can select correctly even if
+    they want to (1.4).
+    Change:
+      - add auc_val, val_loss, n_eff_test to the CSV row in train_v2.py:308
+      - add a `scripts/select_run.py` that calls core.validation.select_by_val
+        over the log and prints which run SHOULD be deployed
+      - print expected_max_of_noise over the log's auc_val on every run, so the
+        operator sees when their best run is inside the noise band
+    Acceptance: rerunning selection on the existing 12 runs names a run by
+    auc_val; if that run differs from 2026-08-17T15-47-17, redeploy it and note
+    the change in the README.
+    Effort: 0.5 day.
+
+3.4 Freeze a permanent, never-trained-on tail
+    Problem: today's holdout moves forward every time you refetch, and any model
+    retrained after 2026-09-07 will have trained on part of it.
+    Change: reserve the last N months as a locked evaluation set, recorded by
+    date in assembly/config.yaml, and make train_v2.py refuse to read rows past
+    that date unless an explicit --use-holdout flag is given. data_fetch/holdout.py
+    already computes the export-stamp cutoff; extend it with a configured
+    `frozen_eval_start`.
+    Acceptance: training aborts with a clear error if the config's data_path
+    contains rows after frozen_eval_start.
+    Effort: 0.5 day.
+
+3.5 Record a data cutoff inside meta.json
+    Today the only durable record of what a model saw is its export stamp
+    (which is what data_fetch/holdout.py uses, deliberately). Add the actual
+    max(ts) of the training span, the fold index, the split boundaries and the
+    row count to meta.json at export time (core/export_onnx.export_model).
+    Acceptance: meta.json for a new run contains train_end_ts, val_end_ts,
+    test_end_ts, fold_id, n_rows.
+    Effort: 0.25 day.
+
+--------------------------------------------------------------------------------
+4. TIER 1 — PROTOCOL AND DEPLOYMENT FIXES (cheap, provably wrong today)
+--------------------------------------------------------------------------------
+
+4.1 Refit the deployed model on all available data  [HIGHEST EXPECTED VALUE]
+    Problem: 1.3 — shipped weights end 2025-05-02.
+    Change: after walk-forward evaluation selects a CONFIGURATION on val, do a
+    final refit on the full series (minus the frozen eval tail from 3.4) using
+    the epoch count / early-stopping epoch distribution learned from the folds,
+    and export THAT model. The walk-forward run's job is to estimate performance
+    and pick hyperparameters; it should not also be the source of the artifact.
+    Implementation sketch in train_v2.main():
+      folds  = [run_fold(...) for each split]            # estimate + select
+      n_ep   = int(np.median([f["best_epoch"] for f in folds]))
+      final  = train ensemble on (0, frozen_eval_start) for exactly n_ep epochs
+      export(final)                                       # not folds[-1]
+    Caveat to state honestly in the code: the final model has no held-out
+    estimate of its own. Its expected performance is the walk-forward mean, and
+    that must be what meta.json reports, clearly labelled.
+    Acceptance: meta.json train_end_ts is within one week of the data's max ts.
+    Effort: 1 day. Expected impact: large but unquantified — this is the single
+    biggest difference between the artifact and what the protocol intends.
+
+4.2 Anchor the barriers on the last OBSERVED close
+    Problem: 1.9 — 43.9% of the barrier width is an unobserved bar.
+    Change: in features.add_features, either
+      (a) pair window X[i-seq_len:i] with a label whose barriers are anchored at
+          close[i-1] and whose path scan starts at bar i; or
+      (b) keep the anchor at close[i] but include bar i in the window (i.e. pair
+          X[i-seq_len+1:i+1] with labels[i]).
+    (b) is a one-line index change and makes the label answer "from the price I
+    can see right now, which barrier is hit first" — which is also what the
+    trading bot needs. (a) is more invasive but keeps the current window.
+    IMPORTANT: this changes the anchoring convention that apps/backtest.py,
+    models/trend/predict.py and apps/test_backtest.py all encode. Update all
+    four together, and `test_batch_scoring_matches_the_live_path` will catch a
+    partial change.
+    Acceptance: the live path and the backtest still agree to 1e-3; the barrier
+    the bot places equals the barrier the label used.
+    Effort: 1 day including the consumer updates.
+    Expected impact: moderate. Removing 44% of irreducible noise from the target
+    definition should show up in val AUC if anything will.
+
+4.3 Recalibrate the output, and stop hardcoding 0.5
+    Problem: 1.6 — calibration gap +0.131; 1.7 — prior shift 50/50 -> 62/38.
+    Change:
+      - fit isotonic regression or Platt scaling on the VALIDATION fold and
+        store the calibrator in the scaler bundle next to target_spec
+      - apply it in models/trend/predict.run_trend_onnx (or bake it into the
+        ONNX graph as the quantile model does with its conformal offsets —
+        models/quantile/model.py:71 is the pattern to copy)
+      - replace the hardcoded `p_up >= 0.5` in apps/backtest.py:309 and in the
+        bot with a threshold chosen on validation
+      - report Brier score and a reliability table alongside AUC everywhere
+    Note: calibration fixes the DECISION, not the RANKING. It will improve
+    accuracy and the -13.11pp edge against majority; it will not move AUC. Say
+    so in the report so nobody reads a calibration fix as a discovery.
+    Acceptance: holdout Brier score improves; mean p_up tracks the realised base
+    rate within the CI; reliability table is monotone.
+    Effort: 1 day.
+
+4.4 Adaptive class prior
+    Problem: class_weight: auto freezes the training prior.
+    Change: either drop class weighting entirely and let calibration handle the
+    prior (cleaner), or re-estimate the prior on a trailing window at serving
+    time and shift the logit by log(pi_new/(1-pi_new)) - log(pi_train/(1-pi_train)).
+    The second is a standard prior-shift correction and is two lines.
+    Risk: a trailing-window prior is itself a momentum bet. Test it on the
+    rolling evaluation from 3.2 before shipping — it may simply be buying the
+    recent trend, which is a strategy, not a model improvement.
+    Effort: 0.5 day + evaluation.
+
+4.5 Stop reporting the 50/50 blend as a headline
+    Problem: 1.11 — GBM is at chance on fold 2, so the blend is strictly worse
+    than the ensemble on the exported fold.
+    Change: keep the GBM as a diagnostic baseline (it is a good one), but choose
+    the blend weight on validation rather than fixing it at 0.5, and allow 0.
+    Effort: 0.25 day.
+
+4.6 Cap the sample weights
+    Problem: 1.10 — top 10% of samples carry 39.1% of the weight.
+    Change: winsorise raw_w at, say, the 95th percentile, or use
+    sqrt(|realized|) * uniqueness instead of the raw product. Sweep the cap on
+    validation.
+    Effort: 0.25 day + a sweep.
+
+4.7 Turn off continuous_training as a deployment path
+    config.yaml:7 sets continuous_training: true. Combined with the run log
+    being test-side (1.4), this is a machine for generating noise-max artifacts.
+    Continuous training is fine as a search process; it must not be allowed to
+    pick what ships. Gate deployment behind 3.3's select_run.py.
+    Effort: 0.25 day.
+
+--------------------------------------------------------------------------------
+5. TIER 2 — TARGET REDESIGN
+--------------------------------------------------------------------------------
+Ordered by (expected value / effort). Each is a separate experiment, each judged
+on validation only, each reported with n_eff and a block-bootstrap CI.
+
+5.1 Fix the horizon/label mismatch
+    Median span is 6 bars against max_holding 24 (1.5). Two coherent options:
+      (a) reduce max_holding to ~8 and widen the barrier so the label resolves
+          near the vertical barrier rather than long before it; or
+      (b) keep 24 bars and widen the barriers (3.5-4.0 sigma) so the horizontal
+          barriers stop dominating.
+    (b) was tried at 3.5 sigma and lost on val (0.5122 vs 0.5237 at 2.5), but
+    that sweep was done with the current, mis-anchored label (4.2) and the
+    stale-fold artifact. It is worth redoing once 4.2 lands.
+    Sweep on VAL only: upper/lower in {1.75, 2.5, 3.5}, max_holding in {6, 12, 24, 48}.
+    That is a 12-cell grid; note in advance that with 12 cells the expected max
+    of noise is ~1.6 sd above the mean, so require the winner to beat the second
+    place by more than the seed std (0.005) before believing it.
+
+5.2 Meta-labelling (Lopez de Prado)  [most promising target change]
+    Instead of asking the LSTM for direction, take a simple primary signal
+    (e.g. MTF trend filter, or the sign of a moving-average cross) and train the
+    model to answer "should I take this signal or skip it?" — a binary bet-sizing
+    problem on a much cleaner label. This converts a hard direction problem into
+    an easier precision problem, and it directly produces the abstention the
+    trading bot wants.
+    Why it fits here: the model already has a usable top-decile signal in
+    training (0.5980 vs 0.5060 majority on fold 2). Meta-labelling makes that
+    the entire objective instead of a footnote.
+    Effort: 3-5 days. Evaluate as precision at fixed coverage, not AUC.
+
+5.3 Three-class target with an explicit abstain class
+    Currently unresolved anchors (-1) are dropped from training AND from
+    accuracy. On the holdout that is 17.4% of anchors — a sixth of the data
+    silently discarded. Predicting "neither barrier" as a third class uses them
+    and gives the bot a reason not to trade.
+    Effort: 2 days.
+
+5.4 Regress the realised move instead of classifying its sign
+    triple_barrier_labels already returns `realized`. Training on it (Huber loss,
+    volatility-normalised) uses magnitude information that the binary label
+    throws away, and the sign of the prediction recovers the classifier.
+    Effort: 2 days.
+
+5.5 Predict volatility or barrier-touch TIME rather than direction
+    An honest fallback if direction stays unmeasurable. "Will the barrier be
+    touched within N bars" and "how wide should the barrier be" are both easier
+    problems, both useful to the bot, and the quantile model already shows this
+    family works here (holdout coverage 91.09% vs 90% nominal — the one thing in
+    this repo that demonstrably generalises out of sample).
+    Effort: 3 days. Strategic value: high — it is where the measured edge is.
+
+--------------------------------------------------------------------------------
+6. TIER 3 — FEATURES
+--------------------------------------------------------------------------------
+Current set: 52 features from OHLCV + ETH/SOL + DXY/VIX (config.yaml:134-157).
+All price/volume-derived. The gaps below are ordered by expected information gain
+per unit of engineering effort.
+
+6.1 Order-flow and microstructure (highest value, moderate effort)
+    Binance provides these and the fetcher already talks to the API:
+      - taker buy/sell volume imbalance per bar (aggTrades, or the klines
+        taker_buy_base / taker_buy_quote columns, which binance_klines.py
+        ALREADY FETCHES at lines 52-53 and then DROPS at line 57)
+      - trade count vs volume (average trade size is present; add its skew)
+      - order-book imbalance at top N levels (depth snapshots, needs a collector)
+      - realised spread / effective spread proxies
+    The taker-buy column is free: it is already in the response, already
+    discarded. Adding taker_buy_base/volume as a feature is a one-line change to
+    binance_klines.fetch_klines plus a feature in build_features_df. Do this first.
+    Expected: order-flow imbalance is the single most-cited short-horizon
+    predictor in the microstructure literature. If nothing here helps, that is
+    itself strong evidence about the ceiling.
+
+6.2 Derivatives positioning (high value, low effort — partly present)
+    funding_rate is already fetched and used (2 features: funding_rate_scaled,
+    funding_rate_cum3). Missing:
+      - open interest (fapi /futures/data/openInterestHist) and its rate of change
+      - long/short account ratio and top-trader position ratio
+      - basis: perp price vs spot index, and the term structure vs quarterly
+      - liquidation volume (forced flow is mechanically predictive of short-term
+        reversals)
+    Effort: 2 days for the fetchers + freshness checks (extend
+    data_fetch/binance_klines.check_freshness, which already exists for this).
+
+6.3 Cross-sectional / market-structure
+      - BTC dominance and USDT dominance (config.yaml:144-147 has btc_d and
+        usdt_d wired with empty paths — the plumbing exists, only the CSVs are
+        missing)
+      - breadth: fraction of top-N alts above their own 24h/7d moving average
+      - a proper alt index rather than SOL alone (alt_index is also wired, empty)
+    Effort: 1-2 days. Note that this closes three placeholders already in the config.
+
+6.4 Volatility term structure and regime
+      - realised vol at 24/72/168 exists; add the RATIO structure explicitly
+        (rv_24/rv_168) as a regime indicator
+      - Parkinson / Garman-Klass / Rogers-Satchell estimators from OHLC — much
+        lower variance than close-to-close at the same sample size
+      - a regime label (trending/ranging via ADX or a Hurst exponent) either as a
+        feature or as a gate that selects between two models
+    Effort: 1 day. Low risk, likely small gain.
+
+6.5 Time and session structure
+      hour_sin/cos and dow_sin/cos exist. Missing:
+      - explicit Asia/Europe/US session flags and session-open/close proximity
+      - CME futures gap indicator and weekend flag (BTC trades through the
+        weekend; the derivatives complex does not)
+      - proximity to funding settlement (8h cycle) — mechanically important
+      - macro release calendar (CPI, FOMC) as a blackout/volatility flag
+    Effort: 1-2 days. Funding-cycle proximity is the highest-value item here.
+
+6.6 On-chain (highest effort, most speculative)
+      exchange net flows, stablecoin supply changes, miner flows, active
+      addresses. Requires a paid data source and careful lag handling (most
+      on-chain aggregates publish with delay; using them at their nominal
+      timestamp is a leak). Defer until 6.1-6.5 are exhausted.
+
+6.7 Feature pruning — probably as valuable as adding
+    52 features on ~4500 effective training samples (22389 rows x uniqueness
+    ~0.2) is a poor ratio. Run:
+      - permutation importance on validation, per fold
+      - clustered feature importance (group correlated features before ranking;
+        with 3 correlation windows and 3 amihud windows the set has obvious
+        collinear blocks)
+      - drop everything below noise and re-run; a 15-feature model that matches
+        a 52-feature model is a better model, and it will drift less (1.8 shows
+        the drifting block is the mtf daily group)
+    Effort: 2 days. This may be the single highest-value item in Tier 3.
+
+6.8 Feature-drift gating in production
+    core/validation.feature_drift already exists and train_v2 already calls it.
+    Wire it into serving: compute the drift of the live window against the
+    scaler's fitted distribution, and refuse to emit a signal (or widen
+    uncertainty) when more than K features exceed the threshold. On today's
+    holdout that would have flagged 5 features at >0.75 sd.
+    Effort: 1 day.
+
+--------------------------------------------------------------------------------
+7. TIER 4 — ARCHITECTURE (last, deliberately)
+--------------------------------------------------------------------------------
+The 184-run log established that hyperparameters do not matter on this data
+(hidden_size correlation +0.000, seed std 0.005). model.py:9-12 already argues
+for a Transformer. That may be right eventually, but it is the wrong next move:
+a new architecture evaluated with the current measurement apparatus (section 2A)
+will produce a number nobody can interpret.
+
+Order, once Tier 0-1 is done:
+
+7.1 A linear/logistic baseline on the same features
+    If a regularised logistic regression on window aggregates matches the LSTM,
+    the sequence model is not earning its keep. This is a 1-hour experiment that
+    should have existed from the start and it bounds every later claim.
+
+7.2 Gradient boosting on engineered window aggregates
+    Not GBM on the last bar (which is what train_v2.py:169 does and which sits at
+    chance). Give the trees min/max/mean/slope/last of each feature over the
+    window. Trees handle 52 correlated features on a small effective sample much
+    better than an LSTM, and this is the strongest realistic contender.
+    Effort: 2 days.
+
+7.3 Temporal CNN / dilated convolutions
+    Cheaper to train than attention, better inductive bias for fixed-length
+    windows than an LSTM. Effort: 2 days.
+
+7.4 Transformer encoder / TFT
+    Only if 7.1-7.3 show that sequence structure is being under-used and the
+    measurement from Tier 0 can resolve the difference. With n_eff ~ 4500
+    training labels, a Transformer is very likely to overfit.
+    Effort: 1-2 weeks.
+
+7.5 Ensembling across ARCHITECTURES rather than seeds
+    Seed ensembling already removed the seed lottery. Averaging structurally
+    different models (logistic + trees + LSTM) usually helps more, and their
+    disagreement is a free uncertainty estimate (core/validation.ensemble_spread
+    already computes it and nothing consumes it).
+    Effort: 1 day once 7.1-7.2 exist.
+
+--------------------------------------------------------------------------------
+8. TIER 5 — PRODUCTION AND MONITORING
+--------------------------------------------------------------------------------
+8.1 Scheduled retraining with a fixed cadence and an automatic staleness alarm.
+    Today staleness is only a printed warning at training time
+    (core/validation.warn_if_stale). Make serving refuse, or loudly degrade, when
+    the artifact's train_end_ts (from 3.5) is more than N weeks old. On the
+    current artifact that alarm would have been firing for 16 months.
+
+8.2 Shadow-mode evaluation before any promotion. Serve the candidate alongside
+    production, log both, promote only after the frozen eval tail (3.4) and the
+    rolling evaluation (3.2) agree.
+
+8.3 Live calibration monitoring. storage/prediction_metrics.py already computes
+    coverage and accuracy from stored predictions; add mean p_up vs realised
+    base rate and a Brier score, and alert on the calibration gap crossing a
+    threshold. Today's gap is +0.131 and nothing reports it.
+
+8.4 Keep the holdout evaluation in CI. apps/holdout_eval.py already exists;
+    run it on a schedule and store the result so the model's decay is a time
+    series rather than a one-off finding.
+
+--------------------------------------------------------------------------------
+9. REPRODUCING THE MEASUREMENTS IN THIS DOCUMENT
+--------------------------------------------------------------------------------
+  # holdout evaluation (both models)
+  PYTHONPATH=. python -m technical_analysis_trainer.apps.holdout_eval
+
+  # holdout cache status / refresh
+  PYTHONPATH=. python -m technical_analysis_trainer.data_fetch.holdout --status
+  PYTHONPATH=. python -m technical_analysis_trainer.data_fetch.holdout --refresh
+
+  # the test suites (leak/invariance, on unseen candles)
+  PYTHONPATH=. python -m technical_analysis_trainer.models.trend.test_spans
+  PYTHONPATH=. python -m technical_analysis_trainer.apps.test_backtest
+  PYTHONPATH=. python -m technical_analysis_trainer.apps.test_backfill_predictions
+  PYTHONPATH=. python -m technical_analysis_trainer.core.test_validation
+  PYTHONPATH=. python -m technical_analysis_trainer.storage.test_prediction_metrics
+
+Sections 1.3, 1.5, 1.7, 1.8, 1.9, 1.10 and the power analysis were computed with
+ad-hoc scripts on 2026-09-07. They should become a permanent
+`apps/diagnose_trend.py` as part of task 3.1 so they can be re-run after every
+change rather than reconstructed.
+
+--------------------------------------------------------------------------------
+10. SEQUENCING
+--------------------------------------------------------------------------------
+Phase 1 — measurement, ~3 days, no modelling
+  3.1 block-bootstrap CIs + n_eff reporting
+  3.3 val metrics in the run log + select_run.py
+  3.5 data cutoff in meta.json
+  3.4 frozen evaluation tail
+  3.2 (cheap version) monthly evaluation of the deployed artifact
+  Deliverable: an honest current-state report. Possible outcome: the model is
+  revealed to be indistinguishable from chance over 8 months, not just 3 weeks.
+
+Phase 2 — protocol fixes, ~4 days, still no new features
+  4.1 refit on all data          <- do this one first
+  4.7 gate deployment on select_run.py
+  4.3 calibration + tuned threshold
+  4.2 barrier anchored on the observed close
+  4.5, 4.6 blend weight and weight capping
+  Deliverable: a correctly-built artifact of the SAME model class, re-measured
+  with Phase 1's apparatus. This is the number every later experiment is
+  compared against. Expect it to differ substantially from both 0.5855 and 0.4794.
+
+Phase 3 — cheap feature wins, ~4 days
+  6.1 taker-buy imbalance (already fetched and discarded — start here)
+  6.2 open interest, basis, liquidations
+  6.5 funding-cycle proximity, session flags
+  6.7 prune to a defensible feature count
+  6.8 drift gating in serving
+
+Phase 4 — target redesign, ~1-2 weeks
+  5.1 re-sweep barrier geometry on the fixed label
+  5.2 meta-labelling
+  5.3 three-class with abstain
+  5.5 volatility/touch-time targets as the hedge
+
+Phase 5 — architecture, ~1-2 weeks, only if Phases 1-4 leave headroom
+  7.1 linear baseline, 7.2 GBM on window aggregates, 7.3 TCN, then 7.4/7.5
+
+--------------------------------------------------------------------------------
+11. KILL CRITERIA
+--------------------------------------------------------------------------------
+This section exists because the repo's own history (184 runs plateauing at 0.53,
+then 12 more plateauing at 0.52 +- 0.02) suggests the answer may be that there is
+no edge to find at 1H on OHLCV-derived features. Decide in advance what would
+settle it.
+
+  - If after Phase 2 the correctly-built, correctly-measured artifact has a
+    pooled out-of-sample AUC whose block-bootstrap CI contains 0.5 across >= 6
+    monthly windows, stop adding features and go to 5.5 / 6.1. Direction at 1H
+    is not the product.
+  - If Phase 3's order-flow features do not move validation AUC by more than the
+    seed std (0.005), conclude that OHLCV-derived information is exhausted and
+    that further gains need a different data class, not a different model.
+  - If meta-labelling (5.2) cannot reach precision materially above the base
+    rate at any coverage level, the direction signal is not tradable regardless
+    of how it is packaged.
+  - Positive kill criterion, stated so success is also falsifiable: the trend
+    model is worth deploying when, on the frozen evaluation tail, it beats the
+    majority baseline by a margin whose block-bootstrap CI excludes zero across
+    at least 6 non-overlapping monthly windows.
+
+Meanwhile the quantile model's interval coverage (91.09% out of sample against a
+90% nominal) is the one thing in this repo that demonstrably generalises. If the
+trend work stalls, that is where the product is.
+
+--------------------------------------------------------------------------------
+12. WHAT THIS PLAN DELIBERATELY DOES NOT DO
+--------------------------------------------------------------------------------
+  - It does not propose a Transformer as the next step, despite model.py:11
+    recommending one. Architecture is cause F, not cause A.
+  - It does not propose more seeds, more folds or more hyperparameter search.
+    The 184-run log settled that question.
+  - It does not treat the -13.11 pp holdout edge as an established negative
+    result. With n_eff ~ 76 it is not one, and building a plan on it would
+    repeat the error the plan is trying to fix.
+================================================================================
+
+================================================================================
+13. EXECUTION LOG — PHASES 1 AND 2, 2026-09-07
+================================================================================
+
+13.1 What was built
+
+  Tier 0 (measurement)
+    core/protocol.py                     frozen_eval_start, enforced at training
+    core/metrics.block_bootstrap_ci      CIs that respect label overlap
+    core/metrics.effective_n             independent-observation count
+    core/export_onnx (provenance)        train_end_ts etc. inside meta.json
+    models/trend/select_run.py           deployment choice on auc_val only
+    train_runs_v2.csv                    gained auc_val, val_loss, anchor,
+                                         train_end_ts, frozen_eval_start;
+                                         old rows migrated with blanks
+
+  Tier 1 (protocol)
+    train_v2.train_final                 the artifact is a refit on the whole
+                                         permitted span, not folds[-1]
+    core/calibration.py                  Platt scaling + fitted decision cut,
+                                         carried in the artifact bundle
+    target.ANCHOR_*                      barrier anchored on the last OBSERVED
+                                         close; convention recorded per artifact
+                                         so old ones keep their old indexing
+    backtest.py                          applies the artifact's calibration and
+                                         cut, reports Brier + reliability,
+                                         derives stale-input warnings from data
+
+  Data
+    BTC/ETH/SOL refetched to a common span 2021-10-03 .. 2026-09-07 (43199 bars
+    each). SOL had stopped at 2026-04-17, so xmkt_log_ret_sol was a forward-
+    filled constant across the whole evaluation period; it is now live.
+    frozen_eval_start = 2026-08-01 -> 42303 training rows, 896 evaluation bars.
+
+13.2 The run
+
+  2026-09-07T07-52-06, trained to 2026-03-12, calibrated on 2026-03-14..07-31.
+  Walk-forward (3 folds x 5 seeds): auc_val 0.5512, auc_ens 0.5564,
+  auc_gb 0.5161, acc_ens 0.5367 vs majority 0.5056, top-decile 0.6183.
+  Single-seed AUC 0.5518 +- 0.0155; best-of-15 noise expectation 0.5755,
+  observed best 0.5772 — i.e. the best SEED is exactly at the noise max, which
+  is why the ensemble and not the best seed is what ships.
+
+13.3 Result on the frozen August set (871 anchors, 731 resolved, n_eff 141)
+
+  ROC-AUC 0.5172   accuracy 46.65% (block CI 38.03-52.94%)
+  majority (always UP) 60.74%   edge -14.09 pp
+  mean p(UP) 0.4914 vs actual 0.6074
+
+  Decomposition — this is the useful part:
+    shipped cut 0.510        46.65%
+    ORACLE cut 0.430         62.65%   <- tuned ON the eval window, upper bound
+    always-UP                60.74%
+    oracle advantage         +1.92 pp at n_eff 141
+
+  So the -14 pp headline is a wrong decision cut, not a wrong ranking; and
+  correcting the cut perfectly recovers to the baseline, not past it. The
+  calibrator was fitted where UP ran at 51.9% and served where it ran at 60.7%,
+  which is prior shift — task 4.4, deliberately deferred, and now the highest-
+  value remaining item.
+
+13.4 THE CORRECTION THAT MATTERS
+
+  On the IDENTICAL window (2026-08-17 .. 09-07, n=389, n_eff 76):
+
+    old 2026-08-17T15-47-17   AUC 0.4794   acc 48.07% (block CI 35.22-61.44)
+    new 2026-09-07T07-52-06   AUC 0.4558   acc 44.22% (block CI 32.13-55.27)
+
+  The new model is NOT better. It is point-estimate worse. The apparent
+  improvement from 0.4794 to 0.5172 is entirely an artifact of comparing two
+  different evaluation windows — the new model's window starts 1 August, the old
+  model's cannot, because the old model trained through mid-August.
+
+  This nearly became the headline of this document, which is precisely the error
+  section 2A predicts and section 12 forbids. Recorded here so the next person
+  does not repeat it: with block CIs ~25 pp wide, neither model is
+  distinguishable from the other or from a coin.
+
+13.5 What actually improved
+
+  Nothing measurable about the model. What improved is that the result is now
+  legible: label overlap is priced into every CI, effective n sits next to
+  nominal n, the training boundary is a config value the trainer enforces rather
+  than an index re-derived after the fact, the deployed run is chosen on
+  validation, and the artifact carries a record of what it was allowed to read.
+  Under the old apparatus this same model would have been reported as 0.5855.
+
+13.6 Next, in order
+
+  1. 4.4 prior-shift correction — the decomposition in 13.3 says the entire
+     visible deficit lives here. Estimate the base rate on a trailing window and
+     shift the logit; evaluate on the rolling harness, not on one window,
+     because a trailing prior is itself a momentum bet.
+  2. 3.2 rolling monthly evaluation of the fixed artifact. One 5-week window at
+     n_eff 141 cannot resolve anything; ~8 monthly points can. Cheap, no
+     retraining.
+  3. 6.1 taker-buy imbalance — still fetched and discarded at
+     data_fetch/binance_klines.py:57.
+  4. 6.7 feature pruning. The fold logs flagged xmkt_corr_main_eth_{24,72,168}
+     drifting -0.87 to -1.66 sd between train and test in folds 0 and 1; a block
+     that unstable is a candidate for removal, not just for monitoring.
+  5. Re-run 5.1 (barrier geometry) now that the anchor is fixed — the old sweep
+     that chose 2.5 sigma was run against the mis-anchored label.
+
+================================================================================
+14. EXECUTION LOG — ROLLING MEASUREMENT, PRIOR SHIFT, ORDER FLOW (2026-09-07)
+================================================================================
+
+14.1 What was built
+
+  apps/rolling_eval.py       one model per monthly origin, each scored on the
+                             month after it; 18 origins, 5 seeds, fold-derived
+                             epoch budget. Trains ~18 models, so it runs in the
+                             background. Scores the prior-shift variant on the
+                             same anchors, so the correction is judged across
+                             regimes rather than on one window.
+  core/calibration
+    trailing_prior()         base rate of RESOLVED barrier outcomes per bar.
+                             Each label is credited to the bar it resolves on,
+                             not its anchor, so the value at t uses only what a
+                             live system knew at t.
+    apply_prior_shift()      logit re-centring from a reference prior onto the
+                             current one.
+    Calibrator.shift()/cut() carried in the artifact; cut() returns 0.5 once the
+                             shift has re-centred, so the correction is never
+                             applied twice.
+  predict/backtest           both apply the shift, from the same trailing prior.
+  features                   six order-flow inputs from taker_buy_base, behind
+                             an `order_flow` config flag.
+  data_fetch + runtime       stop discarding taker_buy_base (both the training
+                             fetcher and the live feed dropped it).
+  predict._overlay_csv_tail_with_live
+                             union of columns instead of projecting onto the
+                             CSV's — the projection silently dropped every newly
+                             added live column until the CSV was regenerated.
+  backfill warnings          mean-filling a missing feature now prints; both
+                             call sites discarded the list of what it filled.
+  test_trailing_prior_ignores_future_candles
+                             pins the no-lookahead property of the base rate.
+
+14.2 THE MEASUREMENT THAT MATTERS — 18 rolling monthly origins (2025-03..2026-08)
+
+  Baseline feature set (52):
+    AUC mean 0.5268 (std 0.0816, min 0.3879, max 0.7177)
+    13/18 months above 0.5, one-sided sign test p = 0.048
+    pooled AUC 0.5395 (n=8608)
+
+  This is the first evidence of a real ranking edge in this repo, and it is
+  small: AUC ~0.53-0.54. It is only visible because 18 independent windows were
+  used. Section 3.1's power analysis predicted this would take ~10 months of
+  data; it took 18.
+
+  Caveats kept attached: p = 0.048 is marginal and one-sided, and the monthly
+  AUC range (0.39 to 0.72) is enormous. Any single month, including the frozen
+  August set, tells you nothing.
+
+14.3 PRIOR SHIFT — accepted, on paired evidence
+
+  Paired across the same 18 months (58-feature run):
+    accuracy   +4.48 pp   95% CI [+0.28, +8.69]   p = 0.037   15/18 months better
+    Brier      +0.0054    95% CI [+0.0025, +0.0083]  p = 0.0004  15/18 better
+
+  Shipped: `prior_shift: true` in models/trend/config.yaml, coefficients and
+  prior_ref in the artifact bundle. Old artifacts default to prior_shift=False,
+  so nothing changes for them.
+
+  What it does NOT do, stated because the frozen-August result makes it vivid:
+  it does not create edge. It moves the decision toward the prevailing base
+  rate. On the frozen set that took accuracy 46.65% -> 56.09% and closed the
+  calibration gap +0.116 -> +0.048, but the model then predicted UP on 92.34%
+  of bars in a 60.74%-UP month and still finished 4.65 pp BELOW always-UP. A
+  trailing base rate is a momentum bet; it flatters a trending window. That
+  warning is in the docstring of apply_prior_shift and it should stay there.
+
+14.4 ORDER FLOW — no measurable benefit
+
+  Paired across the same 18 months, 52-feature vs 58-feature:
+    AUC        +0.0092   95% CI [-0.0138, +0.0323]  p = 0.433   10/18 better
+    accuracy   +0.0038   95% CI [-0.0122, +0.0197]  p = 0.645    9/18 better
+    Brier      +0.0005   95% CI [-0.0018, +0.0028]  p = 0.675    7/18 better
+
+  Every point estimate is positive and none is distinguishable from zero. The
+  sign test on AUC-above-0.5 actually degraded (13/18 -> 11/18).
+
+  Kept, not removed, and the reasoning is worth being explicit about: the data
+  is free, the point estimate is favourable, and this is the only signed
+  order-flow information in the model. But it is NOT demonstrated, it worsens
+  the feature-to-effective-sample ratio (58 inputs on ~4500 effective training
+  labels), and the `order_flow` flag exists so task 6.7 can retest cheaply.
+  Anyone quoting this block as an improvement is overreading it.
+
+14.5 The frozen August set, third reading
+
+  run 2026-09-07T09-23-09 (58 features, prior shift on), 731 resolved, n_eff 141:
+    accuracy 56.09% (95% block CI 49.11-65.53)   majority 60.74%   edge -4.65 pp
+    ROC-AUC 0.4343      mean p(UP) 0.5590 vs actual 0.6074
+
+  Versus the previous artifact on the same window: accuracy 46.65% -> 56.09%,
+  edge -14.09 -> -4.65 pp, but AUC 0.5172 -> 0.4343.
+
+  The window has now given three different answers about three artifacts, and
+  the block CIs overlap heavily every time. Treat the rolling harness as the
+  measurement and this set as a smoke test — which is what a frozen holdout of
+  141 effective observations is good for.
+
+14.6 Deployment
+
+  Selected by auc_val via select_run.py: 2026-09-07T09-23-09 (0.5543) over
+  2026-09-07T07-52-06 (0.5512). The tool prints that the best of two noise draws
+  would be ~0.5537, i.e. the margin is inside the band — the pick is defensible
+  by the rule, not a demonstrated improvement, and select_run says so.
+
+14.7 Next
+
+  1. 6.7 feature pruning, now with the machinery to test it: permutation
+     importance per fold, then re-run rolling_eval with the reduced set. The
+     xmkt_corr_main_eth_{24,72,168} block drifts -0.87 to -1.66 sd between train
+     and test in folds 0-1 and is the first candidate.
+  2. 5.1 barrier geometry re-sweep on the fixed anchor, judged on rolling AUC.
+  3. 5.2 meta-labelling — the top-decile numbers keep moving (0.62 to 0.68 in
+     training folds, 0.50 on the frozen set), which is what a precision-at-low-
+     coverage objective is for.
+  4. 4.1 follow-up: the final refit still ends 2026-03-12 because calibration
+     takes the last 8%. Consider fitting the calibrator on a rolling basis at
+     serving time instead, which would free that span for training.
+  5. Extend rolling_eval to 30+ origins to tighten the p = 0.048 result. It is
+     the single number the whole programme now rests on.
+
+================================================================================
+15. EXECUTION LOG — FEATURE PRUNING (2026-09-07)
+================================================================================
+
+15.1 apps/feature_importance.py
+
+  Permutation importance on VALIDATION, by collinear block rather than by single
+  feature. Blocks because the set is full of families that are the same statistic
+  at several lookbacks (three amihud windows, three correlation windows, four
+  taker windows); permuting one member understates the family, because the model
+  reads the same information from its neighbours.
+
+  3 folds x 3 seeds, 3 repeats. Mean val-AUC lost when a block is shuffled:
+
+    xmkt returns/spreads              +0.0297   (+0.019, +0.026, +0.044)
+    mtf 1d block                      +0.0127   (+0.022, +0.004, +0.012)
+    funding                           +0.0089   (+0.024, +0.008, -0.006)
+    taker order flow (6)              +0.0075   (+0.005, +0.005, +0.013)
+    amihud (3 windows)                +0.0056
+    range_per_vol (3 windows)         +0.0053
+    ---- seed-noise floor 0.005 ----
+    volume_norm                       +0.0038
+    vol_z (3)                         +0.0036
+    avg_trade_size (3)                +0.0035
+    calendar                          +0.0032
+    bb_position                       +0.0027
+    atr_norm                          +0.0023
+    xmkt_corr_main_eth (3)            +0.0017   <- also the drifting block
+    rsi_scaled                        +0.0017
+    mtf 4h block                      +0.0012
+    ... 
+    momentum (roc_3/6/12, price_roc, macd_hist_norm)  -0.0008
+    dist_from_low                     -0.0018
+    dist_from_high                    -0.0039   (negative in all three folds)
+    atr_ratio                         -0.0042
+
+  19 of 25 blocks fall below the seed-noise floor. Cross-market returns dominate
+  everything else by a factor of two.
+
+15.2 The prune, and the verdict
+
+  Dropped 16 inputs (58 -> 42): the mtf 4h block, xmkt_corr_main_eth_{24,72,168},
+  high_ratio, the momentum block, dist_from_high, dist_from_low, atr_ratio.
+  Config key `feature_exclude`; the columns are still computed, only the input
+  list shrinks, so the drop is reversible without a data rebuild.
+
+  Confirmed on 18 rolling monthly origins, paired against the 58-feature run:
+
+    AUC          -0.0013   95% CI [-0.0229, +0.0204]   p = 0.910   7/18 better
+    accuracy     -0.0018   95% CI [-0.0135, +0.0100]   p = 0.770   9/18 better
+
+  Removing 28% of the inputs costs nothing measurable. Adopted on parsimony: a
+  smaller model on ~4500 effective labels has less to overfit, fewer inputs that
+  can drift (the dropped set includes the block flagged at -0.87 to -1.66 sd),
+  and it restored 13/18 months above 0.5 (the 58-feature set gave 11/18).
+
+  Stated plainly: this is not an improvement, it is the same performance for
+  less. The three feature sets tried so far — 52, 58, 42 — are indistinguishable
+  from each other, and all three land at AUC ~0.53 with 11-13/18 months above 0.5.
+
+15.3 A config-drift trap, closed
+
+  Serving reads models/trend/test_config.yaml; training reads config.yaml. A
+  pruning change in one disagreed with the other, and `add_features` scales with
+  whatever list it builds, so the mismatch surfaced as "X has 58 features, but
+  StandardScaler is expecting 42".
+
+  Fixed properly rather than by copying the key into both files: inference now
+  passes the artifact's own feature list (`features_override`) and builds every
+  available column, so the trained model is the only authority on its inputs —
+  the same principle already applied to target_spec and the calibrator. A
+  genuinely missing column now raises a named error instead of a shape error.
+
+15.4 Deployed
+
+  2026-09-07T11-29-30, 42 features, prior shift on. select_run.py picked it on
+  auc_val 0.5543 and printed the warning that the winner is INSIDE the noise
+  band (best of 3 draws would be ~0.5545) — the pick is by the rule, not a
+  demonstrated gain.
+
+  Frozen August: accuracy 54.72% (block CI 48.29-64.57), AUC 0.4474, majority
+  60.74%, edge -6.02 pp, top decile 60.27%. Still below always-UP, as with every
+  variant so far.
+
+15.5 Where this leaves the programme
+
+  Three phases in, the honest summary is unchanged in substance and much better
+  measured:
+
+    * There is a weak ranking signal, ~0.53 AUC, visible only across many
+      windows (13/18 months above 0.5, p = 0.048). It has survived three
+      feature sets.
+    * Nothing tried so far beats the majority baseline on the frozen set, and
+      the prior shift closes most of the decision gap without creating edge.
+    * The measurement now reports what it should: effective n, block CIs, a
+      validation-only selection gate that warns when its own winner is noise.
+
+  The remaining items in 14.7 stand, with one reordering: extending
+  rolling_eval past 30 origins is now the highest-value next step, because
+  every conclusion above rests on an 18-point sign test at p = 0.048, and the
+  feature work has demonstrated that variant-to-variant differences are far
+  smaller than that test can currently resolve.
+
+================================================================================
+16. EXECUTION LOG — A SPAN-ALIGNMENT BUG, AND WHAT IT INVALIDATED (2026-09-08)
+================================================================================
+
+16.1 The bug
+
+  `build_span` is asked for the bars in [start, end) and hands back windows. It
+  trimmed its warm-up lead-in BY COUNT — drop `len(X) - (end - start)` rows from
+  the left — which is only correct if `add_features` returns one row per bar.
+
+  It does not. Two filters sit in between:
+    * build_features_df ends with a global dropna().reset_index(drop=True);
+    * the windowing loop skips anchors whose label is unresolved, whose label
+      resolves past the end of the frame, or whose window still holds a NaN.
+
+  Together they drop ~51% of candidate bars on a monthly span, non-contiguously.
+  So len(X) came out BELOW the bar count, the trim computed zero, and nothing was
+  trimmed at all. Consequences, all silent:
+
+    a) every val/test span began ~200 bars before its own start, inside the split
+       it was supposed to be held out from;
+    b) rolling_eval's per-bar prior was read at `arange(end-len(X), end)` — an
+       index that ran +47 bars AHEAD of the true anchor on average (max +189);
+    c) warm-up of seq_len+200 was in any case too short for a 168-bar feature
+       set plus the MTF block, so each span silently lost its first 186 bars.
+
+  Nothing failed. Shapes were right and metrics were plausible.
+
+16.2 The fix
+
+  features.add_features(return_index=True)  reports the anchor bar of every row
+                                            it kept, mapped back through
+                                            build_features_df's re-indexing by
+                                            timestamp.
+  train_v2.build_span                       trims with an exact mask on those
+                                            positions, and can return them.
+  train_v2.span_warmup()                    one definition, seq_len+400, replacing
+                                            seq_len+200 repeated at five sites.
+                                            400 saturates (measured).
+  rolling_eval                              uses the true anchor bars for the
+                                            prior, and persists them per row.
+  models/trend/test_spans.py                5 tests. The load-bearing one asserts
+                                            labels[reported_bar] == returned y;
+                                            3 of the 5 fail against the old code.
+  rolling_eval --label-autocorr on|off      so an A/B is a flag, not a config edit.
+
+16.3 THE MEASUREMENT THAT CHANGED
+
+  36 rolling monthly origins, 42 features, re-run with the alignment fixed. The
+  evaluation set grew from 17162 anchors to 23030 (the recovered warm-up bars):
+
+                          before (misaligned)      after (fixed)
+    per-month AUC         0.5373                   0.5512
+    months AUC > 0.5      27/36  (p = 0.002)       28/36  (p = 0.0006)
+    pooled AUC            0.5317                   0.5361
+
+  The model's own result is unchanged in substance and slightly better measured.
+  The edge is still ~0.53-0.55 AUC and still only visible across many windows.
+
+16.4 WHAT IT INVALIDATED — the trailing-prior baseline was reading its future
+
+  Section 15/14 recorded that the trailing base rate of already-resolved barrier
+  outcomes scored pooled AUC 0.5802 on its own against the model's 0.5317 — "a
+  one-line baseline beating the model". That was the misalignment, not a signal:
+
+    prior read at the true anchor bar        AUC 0.5066
+    prior read 50 bars ahead                 AUC 0.5827
+    prior read at the OLD index (+47 mean)   AUC 0.5738
+
+  A prior 50 bars ahead of the anchor has already absorbed the outcome of the
+  label it is being scored against. Per month the honest series scores AUC
+  0.4217 and is above 0.5 in only 5 of 36 months — at this horizon the trailing
+  base rate points the decision the WRONG way more often than not.
+
+  Correspondingly, the model beats it by +0.1295 AUC per month (95% CI
+  [+0.0972, +0.1619], 33/36 months). The ordering in 14.2/15 is reversed.
+
+16.5 TWO SHIPPED SETTINGS TURNED OFF
+
+  prior_shift (was accepted in 14.3 on 18 months)
+    before, misaligned:  accuracy +4.48 pp p=0.037 ; Brier +0.0054 p=0.0004
+    after, 36 months:    accuracy +1.87 pp p=0.21  ; Brier -0.0013 p=0.40
+    The Brier effect changed sign; 11/36 months better. Set to false.
+
+  label_autocorr (added on the 0.5802 finding)
+    clean A/B, 36 months: AUC -0.0025, 95% CI [-0.0170, +0.0119], p=0.73, 15/36
+    Set to false. Both flags remain, so retesting is one argument.
+
+  train_v2's `prior_shift` default also moved True -> False, so a config missing
+  the key cannot switch it back on silently.
+
+  NOT done: the deployed artifact 2026-09-07T11-29-30 still has prior_shift baked
+  into its bundle. Turning the config off changes the next training run, not the
+  running one. Redeploying needs a retrain and a select_run.py pass.
+
+16.6 What is and is not affected
+
+  Affected — every number produced through build_span:
+    train_v2 fold metrics (auc_val/auc_ens/...; the val/test bleed is ~3% of
+    those spans, far smaller than rolling_eval's ~19%, but not zero),
+    rolling_eval (14.2, 14.3, 14.4, 15.2), feature_importance (15.1),
+    barrier_sweep.
+  Not affected — anything that builds each anchor's window by explicit index:
+    apps/backtest.py, apps/holdout_eval.py, models/trend/predict.py, and the
+    live serving path. Their tests pin the anchoring independently and all pass.
+
+  The feature-pruning verdict in 15.2 (42 vs 58 features, no measurable
+  difference) was measured through the bug and has not been re-run. It is a
+  null result on both sides of a noisy comparison, so it is unlikely to flip,
+  but it is not currently evidence.
+
+16.7 The lesson this repo keeps re-learning
+
+  Section 2A says every experiment is unreadable until the measurement is fixed.
+  This is the third time that has bitten: run-level selection on a test metric
+  (1.4), i.i.d. CIs on overlapping labels (1.5), and now an index that looked
+  like an array of bars and was an array of rows. The pattern is the same each
+  time — a quantity that is plausible, unchecked, and load-bearing.
+
+  The countermeasure that worked here was not review, it was an assertion that
+  ties two representations together: labels[reported_bar] == returned_y. Prefer
+  that shape of test over any amount of commentary.
+
+16.8 Next, in order
+
+  1. Re-run apps/feature_importance.py and the 42-vs-58 comparison (15.1, 15.2)
+     under the fixed harness. Cheap, and the pruning decision currently rests on
+     an invalidated measurement.
+  2. Re-run barrier_sweep (5.1) for the same reason.
+  3. Retrain and redeploy so the artifact matches the config (prior_shift and
+     label_autocorr both off), via select_run.py.
+  4. 5.2 meta-labelling. With the harness honest and the coverage table showing
+     55.84% at 10% coverage against a 51.12% base, precision-at-low-coverage is
+     the objective that matches where the signal actually is.
+  5. Extend rolling_eval past 36 origins only if something needs the resolution;
+     at p = 0.0006 the existence of the edge is no longer the open question.
+
+--------------------------------------------------------------------------------
+16.9 ADDENDUM — first model trained under the fixed harness (2026-09-08)
+--------------------------------------------------------------------------------
+
+  Run 2026-09-08T09-00-28, 42 features, prior_shift off, label_autocorr off.
+  Walk-forward (3 folds x 5 seeds), all spans correctly bounded for the first
+  time: fold train/val/test = 14482/5517/5572, 20015/5561/5618, 25600/5624/5734.
+
+    auc_val 0.5512   auc_ens 0.5628   auc_gb 0.5260   acc_ens 0.5418
+    majority 0.5087  top-decile 0.6123   epoch budget 3
+
+  Frozen August set (873 anchors, 731 resolved, n_eff ~141), against the three
+  artifacts that came before it on the SAME window:
+
+    2026-09-07T07-52-06   acc 46.65%   AUC 0.5172
+    2026-09-07T09-23-09   acc 56.09%   AUC 0.4343   (prior shift ON)
+    2026-09-07T11-29-30   acc 54.72%   AUC 0.4474   (prior shift ON)
+    2026-09-08T09-00-28   acc 47.61%   AUC 0.5176   (prior shift OFF)
+
+  The pattern is exactly what 16.5 predicts and is worth stating so nobody reads
+  it backwards: prior shift buys accuracy on this window and costs AUC, because
+  it moves the decision toward a rising base rate without improving the ranking.
+  The two runs with it off have the two best AUCs and the two worst accuracies.
+  At n_eff 141 none of these four is distinguishable from any other; the rolling
+  harness remains the measurement and this window remains a smoke test.
+
+  A TRAP, now live in the run log: select_run.py compares auc_val across runs,
+  and train_runs_v2.csv now mixes runs measured BEFORE the span fix with runs
+  measured after. The pre-fix val spans bled ~200 bars into their own training
+  data, so their auc_val is inflated and not comparable. select_run currently
+  picks 2026-09-07T11-29-30 at 0.5543 over the new run at 0.5512 — while
+  printing that the best of 4 noise draws would be ~0.5542, i.e. the winner sits
+  exactly at the noise max and the whole spread is 0.5527 +- 0.0018.
+
+  So: NOT redeployed. The comparison that would justify a redeploy does not
+  exist yet, because only one run in the log was measured correctly. Either
+  retrain the candidates under the fixed harness before selecting, or stamp the
+  log with a harness version and refuse to select across the boundary.
+
+  Charting. apps/rolling_report.py (new) renders a rolling_eval JSON as four
+  Plotly panels — monthly AUC against 0.5, accuracy vs the majority baseline,
+  accuracy by coverage, and pooled reliability — and takes --compare for an A/B:
+
+    PYTHONPATH=. python -m technical_analysis_trainer.apps.rolling_report \
+      --json artifacts/rolling_eval_fixed_noac.json \
+      --compare artifacts/rolling_eval_fixed_ac.json
+
+  It reads what rolling_eval already writes, so re-rendering costs nothing.
+  apps/backtest.py continues to chart a single artifact over candles; that is
+  the per-anchor view, not the measurement.
+
+================================================================================
+17. IS IT TRADEABLE? (2026-09-08)  — apps/tradeability.py
+================================================================================
+
+The question "the AUC is 0.55, can it be traded" has a different answer from
+"does the ranking carry information", and this repo had no tool that answered
+the first. apps/tradeability.py does, from the rolling-eval JSON, using the real
+realised outcome behind every scored anchor (the `bar` index added in 16.2 is
+what makes that join possible; labels[bar] == y at exactly 1.0000, which is also
+an independent check on the alignment fix).
+
+Payoff model: take-profit at the barrier the label used, stop at its mirror —
+literally the trade the label describes. Half-width ±2.5σ ≈ 1.137%, median hold
+6 bars. Optimistic about fills, so read the gross figures as an upper bound.
+
+17.1 THE RESULT THAT DECIDES IT
+
+  Sequential (one position at a time — what one account can do), 8 bp round trip:
+
+    coverage  trades    acc   gross/trade  break-even   net/trade     t      p
+        2%      123   60.16%    +0.2718%     27.2 bp     +0.1918%   2.42  0.015
+        5%      240   55.83%    +0.1712%     17.1 bp     +0.0912%   2.07  0.039
+       10%      480   52.92%    +0.0753%      7.5 bp     -0.0047%   1.32  0.186
+       20%      972   50.93%    +0.0164%      1.6 bp     -0.0636%   0.41  0.683
+      100%     3718   50.78%    +0.0073%      0.7 bp     -0.0727%   0.37  0.709
+
+  Break-even at 10% coverage is 7.5 bp against a realistic 8-10 bp taker cost.
+  The strategy sits ON the cost line, not above it. Block CI on net per trade at
+  10% coverage: [-0.1150%, +0.1065%] over 480 trades — straddles zero.
+
+17.2 THE TRAP THAT MAKES IT LOOK GOOD
+
+  Scoring every anchor as its own trade gives a completely different picture:
+  +0.1050%/trade net at 10% coverage, t = 6.94, p = 0.000, total +241.78%.
+
+  That is not a strategy, it is unlimited capital. Mean uniqueness is 0.186, so
+  the 2303 anchors in the top decile are ~430 independent bets; the overlapping
+  view takes up to two dozen simultaneous positions in whatever direction the
+  model currently leans. Its entire return comes from three trending months
+  (+241.39%, i.e. 100% of the total; the median month is exactly 0.000% and only
+  12/36 are profitable). Under the one-position constraint the same configuration
+  returns -2.25%.
+
+  Any backtest of an overlapping-label model that does not enforce a position
+  constraint will produce this illusion. It is the economic twin of the
+  n-vs-n_eff error the whole plan has been correcting.
+
+17.3 WHERE IT IS NOT YET FALSIFIED
+
+  At 2% coverage (123 trades in three years) the edge clears costs: 60.16%
+  accuracy, break-even 27.2 bp, p = 0.015. Reasons not to believe it yet: the
+  coverage level was chosen by reading this table (7 comparisons), only 10/36
+  months are profitable, and 123 trades is a small sample. It is a hypothesis to
+  test prospectively, not a result.
+
+17.4 AGAINST SECTION 11'S OWN CRITERION
+
+  "The trend model is worth deploying when, on the frozen evaluation tail, it
+  beats the majority baseline by a margin whose block-bootstrap CI excludes zero
+  across at least 6 non-overlapping monthly windows."
+
+  Not met, and not close: mean edge vs majority is -5.07 pp with 11/36 months
+  positive. The ranking edge (AUC 0.5512, 28/36 months, p = 0.0006) is real and
+  is NOT the same thing as a tradeable edge.
+
+  Verdict: do not trade this with real money. The honest statement is "not shown
+  to make money", which is weaker than "shown to lose money" — at 8 bp the
+  sequential CI contains both signs.
+
+17.5 What would change the answer
+
+  * A target built for the trade rather than adapted to it (5.5: touch-time and
+    volatility are where this repo's only out-of-sample-validated skill lives).
+  * Meta-labelling (5.2), which optimises precision at low coverage directly —
+    17.3 says that is the only region with anything in it.
+  * Costs and the position constraint inside the objective, not bolted on after.
+  * Prospective paper trading before capital, since every number above is a
+    backtest of a procedure that has never run forward.
+
+================================================================================
+18. EXECUTION LOG — BARRIER GEOMETRY, PRICED (2026-09-08)
+================================================================================
+
+Task 5.1, re-run on the fixed anchor and the fixed harness, with the objective
+changed from val AUC to net-of-cost economics as 17.5 asked for.
+
+18.1 What was built
+
+  apps/barrier_sweep.py, substantially rewritten:
+    sequential_pnl()      prices every cell by trading it — one position at a
+                          time, cost charged per trade, ranked by net return per
+                          BAR OF CAPITAL so a geometry that pays double but holds
+                          three times as long loses.
+    timeout accounting    see 18.3; the correction that stops the metric lying.
+    gross_se + guard      a noise band on the P&L, mirroring the AUC band that
+                          was already there. Added after 18.4 proved it necessary.
+  apps/rolling_eval.py  --mult / --holding, so a candidate is confirmed on 36
+                        origins without editing the config the incumbent serves
+                        from; and every row now carries a `geometry` stamp.
+  apps/tradeability.py  prices a run using that stamp rather than config.yaml,
+                        and reports net-per-entered-trade alongside net-per-
+                        resolved.
+
+18.2 The label-side economics (free, no model)
+
+  Break-even accuracy falls steeply with barrier width, because the payoff grows
+  while the cost does not:
+
+    1.75 sigma  width 0.871%  break-even 54.59%
+    2.50 sigma  width 1.245%  break-even 53.21%
+    3.50 sigma  width 1.743%  break-even 52.30%
+    5.00 sigma  width 2.489%  break-even 51.61%
+
+  Against a model that delivers ~53% at low coverage, that spread is the whole
+  question — which is why geometry looked like the most promising lever.
+
+18.3 A BIAS I BUILT AND THEN CAUGHT
+
+  The first version priced only anchors whose label RESOLVED — the only ones the
+  model ever sees. But a live account enters every trade and cannot know which
+  will reach a barrier. At 5 sigma / 12 bars the label resolves 31.1% of the
+  time, so scoring only the resolved ones assumes foreknowledge of two trades in
+  three.
+
+  Priced that way:  5.0 sigma / 12b ranked FIRST at +9.82 bp/bar.
+  Priced honestly:  it ranks FIFTH at +1.99 bp/bar.
+
+  Every cell now reports both, so the size of the correction stays visible. The
+  incumbent barely moves (88.4% resolve), which is exactly why the bias was easy
+  to miss — it only distorts the cells the sweep was about to recommend.
+
+18.4 THE RESULT: THE WINNER DID NOT REPLICATE
+
+  Sweep, 16 cells x 2 folds x 3 seeds, ranked by net/bar at 10% coverage, 8 bp:
+
+    3.50 sigma / 48b   +3.50 bp/bar   net/entered +0.5752%   acc 66.67%   (81 trades)
+    5.00 sigma / 48b   +2.34 bp/bar   net/entered +0.6057%   acc 64.10%   (58 trades)
+    2.50 sigma / 24b   +1.41 bp/bar   net/entered +0.1346%   acc 58.37%  <- incumbent
+    1.75 sigma / *     negative at every holding
+
+  Confirmed on the 36-origin rolling harness — and it collapsed:
+
+                          sweep (2 val folds)     rolling (36 origins)
+    accuracy @2%              —                   43.66%   (3/36 months +)
+    accuracy @10%           66.67%                50.62%
+    net/entered @10%        +0.5752%              -0.0361%
+
+  Every coverage level is net-negative at 3.5 sigma / 48 bars. The incumbent
+  2.5 sigma / 24 remains the best of the geometries actually tested
+  (net/entered +0.1603% at 2% coverage, t = 2.42).
+
+  Mean uniqueness also drops from 0.186 to 0.102 at the wider geometry: longer
+  labels overlap more, so 2361 top-decile anchors are only ~252 independent
+  bets. A wider barrier buys payoff and pays for it in effective sample.
+
+  CONFIG UNCHANGED. 2.5 sigma / 24 bars stands.
+
+18.5 The lesson, which is the same lesson
+
+  The sweep printed "the winner is inside the noise band" about its AUC and said
+  nothing about its P&L, and I ranked on the P&L. An 81-trade validation edge
+  won by a factor of two and then reversed outright.
+
+  This is 1.4 and 2A again in a third costume: run-level selection on a test
+  metric, then i.i.d. CIs on overlapping labels, now a P&L estimated from too
+  few trades. The metric being more economically correct did not make it less
+  noisy. barrier_sweep now prints a t-statistic on the leader's own edge and
+  refuses to endorse it below |t| = 2, pointing at rolling_eval instead.
+
+18.6 Next
+
+  1. Meta-labelling (5.2) is now clearly the highest-value item left: 17.3 and
+     the confidence profile below both say the only exploitable region is low
+     coverage, and meta-labelling optimises precision there directly.
+  2. The confidence ranking is real but weak and NOT monotone (measured on the
+     36-origin run, 2.5 sigma / 24):
+       decile 1  47.24%  [44.38, 49.98]   <- least confident, below a coin
+       deciles 2-9 hover 48.9-53.3%, all CIs overlapping
+       decile 10 55.84%  [51.67, 59.71]
+       Spearman(confidence, correct) = +0.0247, p = 0.0002 pooled;
+       but per month the top decile beats the bottom in only 22/36, p = 0.12.
+     So there IS something to meta-label, and it is thin.
+  3. Feature-importance re-run (16.8 item 1) is still outstanding.
+
+================================================================================
+19. EXECUTION LOG — META-LABELLING (2026-09-09)
+================================================================================
+
+Task 5.2, the item 17.5 and 18.6 both named as the highest-value remaining move.
+Built as apps/meta_label.py and evaluated on the same 36 monthly origins, same
+calibration slice and embargo as apps/rolling_eval, so the numbers sit directly
+beside the direction model's.
+
+19.1 The setup
+
+  Primary: a plain EMA cross, giving a side on every bar.
+  Meta-label: 1 if that side matched the triple-barrier outcome, else 0.
+  Model: the same LSTM on the same 42 features, plus the primary's side as an
+         extra input channel — the point of meta-labelling is that the network
+         spends its capacity on the CONDITIONAL RELIABILITY of a side it is
+         told, not on rediscovering the rule.
+  Objective: precision at low coverage, not AUC.
+
+  Screened first, free, over the whole frame (break-even precision at 8 bp on a
+  1.245% half-width is 53.21%):
+
+    EMA24 > EMA96   51.71%  [50.72, 52.70]
+    mom168          51.21%  [50.27, 52.16]
+    EMA48 > EMA168  51.15%  [50.21, 52.10]
+    EMA12 > EMA48   50.86%  [49.90, 51.88]
+    mom24 reverted  49.32%  [48.43, 50.26]
+    RSI14 revert    43.72%  [41.29, 46.20]
+
+  No rule clears break-even alone. That is the normal starting point; the
+  question is whether the gate lifts one past it.
+
+19.2 Result — two primaries, 36 origins each
+
+                              EMA24>EMA96        EMA12>EMA48
+    primary precision            52.02%             51.04%
+    meta-AUC per month           0.5212             0.5199
+      months > 0.5               25/36 (p=0.014)    23/36 (p=0.066)
+    gated precision @10%         52.15% (+0.13pp)   54.75% (+3.71pp)
+    gated precision @30%         52.83% (+0.81pp)   54.97% (+3.93pp)
+    gated precision @2%          47.17% (-4.85pp)   48.26% (-2.78pp)
+    beat raw primary, months     14/36 (p=0.93)     21/36 (p=0.20)
+
+  Priced at 8 bp, per ENTERED trade (88.4% resolve rate applied):
+
+    EMA24>EMA96   negative at every coverage; best -0.0061% at 50%.
+    EMA12>EMA48   +0.0246% @10%, +0.0294% @30% — marginally positive pooled,
+                  but 14/35 and 19/36 months positive, and the per-month
+                  confidence interval contains zero at EVERY coverage:
+                    @10%  [-0.1175%, +0.0983%]
+                    @20%  [-0.0315%, +0.1231%]
+                    @30%  [-0.0253%, +0.1207%]
+
+19.3 Reading it honestly
+
+  Something is there and it is the same something as everywhere else. Both
+  meta-AUCs land at ~0.52, which is where the direction model, three feature
+  sets and four barrier geometries all landed. The meta-label does not make the
+  problem easier; it re-expresses the same thin signal.
+
+  The one encouraging cell — EMA12>EMA48 lifting precision 51.04% -> 54.97%,
+  above the 53.21% break-even — comes with three warnings that together sink it:
+
+    * it is the SECOND of two primaries tried, and the first was flatly negative.
+      Best-of-two on a noisy metric is exactly the selection 18.5 was written
+      about, one week after 18.5 was written about it.
+    * the resulting edge is ~3 bp per trade, smaller than the spread between a
+      maker and a taker fill. The strategy would be a bet on execution quality,
+      not on the model.
+    * per month it is a coin: 19/36 profitable, CI straddling zero everywhere.
+
+  THE TAIL IS INVERTED, which is the finding that actually matters. Both primaries
+  are WORSE than their own ungated base rate at 2% coverage (-4.85pp and -2.78pp).
+  Meta-labelling exists to buy precision where you are most selective, and here
+  the gate is least trustworthy exactly there. The lift such as it is appears at
+  10-30% coverage, which is not where a low-frequency strategy wants to live.
+
+19.4 Against section 11's kill criteria
+
+  "If meta-labelling cannot reach precision materially above the base rate at any
+  coverage level, the direction signal is not tradable regardless of packaging."
+
+  Strictly, it DID: +3.93 pp at 30% coverage on one primary. So the criterion is
+  not cleanly triggered — but the lift buys 3 bp against an 8 bp cost, is not
+  reproducible across primaries, and inverts in the tail. The defensible summary
+  is "not demonstrated", the same verdict as 17.4, reached by a different route.
+
+  Meanwhile the positive deployment criterion — beat the majority baseline with
+  a block CI excluding zero across >= 6 non-overlapping monthly windows — remains
+  unmet by every variant tried.
+
+19.5 What the accumulated evidence now says
+
+  Five independent attempts have each landed at AUC ~0.52-0.55 with no tradeable
+  net edge:
+
+    direction model, 42 features        per-month AUC 0.5512, 28/36, p=0.0006
+    feature sets 52 / 58 / 42           indistinguishable from each other
+    barrier geometry, 16 cells          winner reversed on the rolling harness
+    trailing-prior baseline             0.5066 once its lookahead was removed
+    meta-labelling, 2 primaries         meta-AUC 0.5199-0.5212
+
+  That convergence is itself the result. It is no longer plausible that the next
+  feature or the next target packaging unlocks a materially larger edge in 1H
+  BTC direction from OHLCV-derived inputs. Section 11 anticipated this and named
+  the exit: 5.5 (predict volatility or barrier-touch TIME instead of direction),
+  where the quantile model already demonstrates out-of-sample skill — 91.09%
+  interval coverage against a 90% nominal, still the only thing in this repo that
+  generalises.
+
+19.6 Next
+
+  1. 5.5 — touch-time / volatility targets. The strategic move, not another
+     direction experiment.
+  2. 6.1 order flow at the DATA level rather than the feature level: the
+     kill criterion in section 11 says a different data class, not a different
+     model, is what is needed now.
+  3. Still outstanding and cheap: feature-importance re-run under the fixed
+     harness (16.8 item 1), and the run-log harness stamp so select_run cannot
+     compare pre- and post-fix auc_val (16.9).
+
+================================================================================
+20. EXECUTION LOG — BARRIER RESOLUTION (PLAN 5.5), 2026-09-09
+================================================================================
+
+Section 11 named this as the exit if direction stayed unmeasurable, and 19.5
+concluded it had. So: same pipeline, same 36 origins, one word changed in the
+question — not "which barrier" but "will EITHER be touched within H bars".
+
+  apps/resolution_eval.py       new
+  features.add_features(label_mode="resolution")
+  train_v2.build_span           threads label_mode through (default unchanged)
+  test_spans                    a sixth test, see 20.2
+
+20.1 THE RESULT — the strongest signal this programme has produced
+
+  36 monthly origins, 5 seeds, identical embargo and calibration slice:
+
+                          2.5 sigma / 24b     5.0 sigma / 12b
+    per-month AUC           0.8054              0.7294
+    months AUC > 0.5        36/36  p<0.0001     36/36  p<0.0001
+    pooled AUC              0.8168              0.7279
+    base resolve rate       88.75%              31.12%
+    top-decile resolve      99.25%              60.87%  (+29.76 pp)
+    top decile beat its
+      own month's base      35/36               36/36
+
+  Every month, both geometries. Nothing else in this repo has done that —
+  direction manages 28/36 at AUC 0.55, and everything else is a coin.
+
+  Not a trivial vol ratio, either. Best one-line baselines on the same anchors:
+
+                          2.5s/24b   5.0s/12b
+    LSTM                    0.8168     0.7279
+    rv_12 / rv_72           0.6626     0.6048
+    rv_168 / rv_72          0.6517     0.6195
+    -sigma_72 (vol level)   0.6050     0.6232
+
+  The model is ~0.15 AUC above the best hand-written predictor. This is the
+  volatility-family skill section 5.5 predicted, and it is large.
+
+20.2 A LABEL BUG, CAUGHT BY THE SAME CHECK AS LAST TIME
+
+  The obvious test for "a barrier was touched" is `spans < max_holding`. It is
+  wrong at a frame's right edge: `triple_barrier_labels` clips its scan to
+  `min(i + max_holding, n - 1)`, so an anchor with nowhere left to look also
+  reports a short span and reads as touched. The `label_end >= n_rows` guard
+  does not catch it, because the clipped span puts label_end just inside.
+
+  Caught by asking the same question that validated the alignment fix — can the
+  label be reconstructed from the frame? `touched[bar] == y` was False. With the
+  last `max_holding` anchors excluded it is True, and
+  test_resolution_label_matches_the_frame now pins it.
+
+  Third time this exact check has earned its keep (16.2, 18.3, here). It is the
+  cheapest reliable tool in the repo.
+
+20.3 IT DOES NOT FIX THE ECONOMICS
+
+  Joined to the direction model by bar, over the same 36 origins, priced per
+  ENTERED trade at 8 bp:
+
+    no filter                       n=25416   resolve 88.75%   net -0.0515%
+    resolution top 10%              n= 2542   resolve 99.25%   net -0.0268%
+    direction top 10%               n= 2249   resolve  100%*   net +0.0591%
+    res top 50% AND dir top 10%     n= 1284                    net +0.0325%
+    res top 30% AND dir top 10%     n=  799                    net +0.0132%
+
+    * the direction run only ever contained resolved anchors, so that 100% is
+      the optimistic resolved-only view flagged in 18.3, not a real filter.
+
+  Adding the resolution filter to the direction filter makes it WORSE at every
+  setting. Two reasons, both structural:
+
+    * it selects volatile stretches, and direction is no easier there — on
+      resolution-filtered anchors direction accuracy is 50.1-52.7%, i.e. nothing;
+    * at 2.5 sigma the base resolve rate is already 88.75%, so lifting it to
+      99.25% moves the direction accuracy you need from 53.91% to only 53.50%.
+
+  The arithmetic is the whole story: net = P(resolve) x (2*acc_dir - 1) x width
+  - cost. Resolution improves the first term. Direction is the second, it is
+  ~0.52, and no amount of the first fixes a second that sits at zero.
+
+  Where the leverage WOULD be real is the wide geometry: at 5.0 sigma / 12 bars,
+  filtering to the top decile takes the required direction accuracy from 55.16%
+  down to 52.64%. But 18.4 measured direction at the wide geometry on this same
+  harness and it collapsed to ~50%. Both halves have to work; only one does.
+
+20.4 What this actually establishes
+
+  A genuine, large, reproducible predictive capability — on a quantity that is
+  not directional. That is worth stating plainly rather than filing as another
+  negative:
+
+    * It is the first thing here to clear the noise floor by a wide margin and
+      hold in every single month.
+    * Its natural uses are non-directional — volatility/straddle exposure, or
+      sizing and trade timing — and this bot is directional, so realising it
+      needs a product decision, not another model.
+    * It corroborates the quantile model rather than competing with it: both say
+      the forecastable object in 1H BTC is volatility. Two independent methods
+      now agree on that, and five methods agree that direction is not.
+
+20.5 Leak tests (models/trend/test_resolution.py)
+
+  An AUC of 0.805 where everything else is 0.52 is either the first real finding
+  here or a leak, so it was attacked rather than accepted. Four tests:
+
+    test_label_ignores_candles_beyond_the_holding_window
+    test_unobservable_anchors_are_excluded
+    test_feature_window_ignores_future_candles
+    test_permuted_labels_destroy_the_signal      <- the load-bearing one
+
+  THE CONTROL: train the identical pipeline on the identical windows with the
+  training labels permuted. Real 0.8607, permuted 0.4446. The signal comes from
+  the data, not the harness.
+
+  Both tests were then checked by INJECTING the faults they claim to catch, and
+  the first attempt found them too weak:
+
+    * The permuted bound was one-sided (`< 0.60`). Feeding the outcome in as a
+      feature and permuting made the model learn the inverse — 0.1179, which is
+      "below 0.60" while proving the pipeline hands over the answer. A clean
+      pipeline must score CHANCE on permuted labels, so the bound is now
+      two-sided: |permuted - 0.5| < 0.10. It catches the injection.
+    * Restoring the clipped-scan bug in features.py fails
+      test_unobservable_anchors_are_excluded and, independently,
+      test_resolution_label_matches_the_frame in test_spans.
+
+  A structural argument backs the tests up: the resolution target shares its
+  feature pipeline, windowing loop and walk-forward split with the direction
+  target. Any lookahead in that shared path would inflate both. Direction stays
+  at 0.52-0.55 on identical inputs, so a leak would have to live in the handful
+  of lines that differ — which is what these tests cover.
+
+20.6 Next
+
+  1. Decide what to DO with a volatility signal. Straddle/gamma exposure and
+     vol-scaled position sizing are the honest candidates; both are product
+     questions before they are modelling ones.
+  2. If direction work continues at all, it needs a different data class
+     (section 11's kill criterion): order book, liquidations, basis — not
+     another target or feature built from OHLCV.
+  3. Still outstanding: feature-importance re-run under the fixed harness
+     (16.8 item 1).
+
+================================================================================
+21. DATA COLLECTION STARTED (2026-09-09) — the clock item
+================================================================================
+
+Section 11's kill criterion said that if order flow does not move validation AUC,
+what direction needs is a different DATA CLASS rather than another model. 14.4
+showed the free proxy (taker buy volume, already in the klines) gives nothing,
+and 19.5 recorded five approaches all landing at AUC ~0.52. So the next real
+attempt needs positioning and order-book data.
+
+21.1 THE CONSTRAINT, MEASURED
+
+  Binance /futures/data/* keeps 30 days and nothing more:
+
+    startTime -30d          accepted
+    startTime -31d and older HTTP 400, "parameter 'startTime' is invalid"
+    oldest 1h point offered  2026-08-19  (~21 days back)
+    /fapi/v1/allForceOrders  404 — the public liquidation endpoint is gone
+
+  There is no archive to buy, scrape or backfill. The length of the eventual
+  training set is fixed by WHEN COLLECTION STARTS, not by effort spent later.
+  This is the only item in the whole plan where delay destroys something.
+
+21.2 What was built
+
+  data_fetch/binance_derivatives.py   open interest, top-trader account and
+                                      position ratios, global account ratio,
+                                      taker buy/sell flow, basis vs index.
+                                      Append-only, idempotent, reports gaps.
+  data_fetch/test_derivatives.py      6 tests on the merge — see 21.4.
+  deploy/docker/crontab               every 6 hours (29 days of margin)
+  deploy/docker-compose.yml           the scheduler's data mount, see 21.3
+  technical_analysis_trainer/.gitignore
+                                      data/derivatives is now TRACKED. It is
+                                      ~1.2 MB a year and it exists nowhere else.
+
+  First run: 696 rows, 15 columns, 0 gaps, 2026-08-11 .. 2026-09-09. `basis`
+  reaches ~8 days further back than the rest, so early rows are partial.
+
+21.3 A LIVE BUG FOUND ON THE WAY IN
+
+  The scheduler mounted the data directory READ-ONLY:
+
+    ../technical_analysis_trainer/data:/app/.../data:ro
+
+  but macro_fred — already in that crontab, daily — writes data/train and
+  data/predict. As configured it fails on write every day, into a log nobody
+  reads. That is exactly the failure its own crontab comment describes: "a stale
+  file does not error ... this is exactly how two of the 54 features went dead in
+  production". The cron job added to fix that could never have worked, and the
+  prod overlay only swaps images so it inherits the same mount.
+
+  Fixed by dropping `:ro` for the scheduler only; the api service still mounts
+  it read-only, which is correct — it only reads.
+
+  Worth noticing that this was found by asking "where does this write, and can
+  it?" rather than by any test. Nothing in the suite covers deployment wiring.
+
+21.4 A CORRECTION I HAD TO MAKE TO MY OWN REASONING
+
+  merge_history() was written to replace `concat` + `groupby("ts").last()`, on
+  the stated grounds that the latter takes the newest row wholesale and would let
+  a NaN from a failed endpoint erase a stored column.
+
+  That was wrong. GroupBy.last() skips NaN by default, so the stored value
+  survives on its own; the suite passes against both implementations. The claim
+  was checked only after being written into the docstring as justification.
+
+  The explicit version is kept, but for an honest reason rather than the invented
+  one: the NaN-skipping is an easily-missed default, and the neighbouring idioms
+  do not share it — swapping in `.nth(-1)` or `.tail(1)` DOES erase the column,
+  and two of the six tests catch that. They guard a future edit; they are not
+  evidence of a past fix, and the docstring now says so.
+
+21.5 Where this leaves the direction question
+
+  Nothing to model yet — 0.9 months of history. The rolling harness wants ~18
+  monthly origins plus a training span, so this becomes testable at roughly two
+  years, with a first weak read possible after six months or so.
+
+  Until then the honest position is unchanged from 19.5 and 20.4: direction is
+  not tradeable on OHLCV, volatility is strongly predictable, and the product
+  decision about what to do with a volatility signal does not depend on this
+  collector at all. This is a bet placed now so that it can be settled later.
+
+================================================================================
+22. FEATURE IMPORTANCE AND THE PRUNE, RE-MEASURED (2026-09-10)
+================================================================================
+
+The last outstanding item from 16.8. Section 15 chose the 42-feature set the
+deployed model still uses, and every number behind that choice was measured
+through the span-alignment bug. Two questions: does the importance ranking hold,
+and is the prune actually free?
+
+Both apps/feature_importance.py and apps/rolling_eval.py gained `--no-exclude`,
+because a prune has to be re-tested against the FULL set. Ranking only the
+survivors of the previous prune can never bring back a feature dropped in error.
+
+22.1 The ranking reproduces
+
+  3 folds x 3 seeds x 3 repeats, 58 features in 25 blocks, validation only.
+  Block importance (val AUC lost when the block is shuffled):
+
+                                    fixed harness    15.1 (buggy)
+    xmkt returns/spreads               +0.0276          +0.0297
+    mtf 1d block                       +0.0114          +0.0127
+    taker order flow (6)               +0.0066          +0.0075
+    funding                            +0.0065          +0.0089
+    amihud (3 windows)                 +0.0055          +0.0056
+    range_per_vol (3 windows)          +0.0049          +0.0053
+    ---- seed-noise floor 0.005 ----
+    ... 20 blocks below the floor, including every block the prune dropped:
+    xmkt_corr_main_eth  +0.0022 | mtf 4h -0.0005 | momentum -0.0012
+    dist_from_high -0.0026 | atr_ratio -0.0030 | dist_from_low -0.0040
+
+  The top six are the same six in nearly the same order (funding and taker order
+  flow swap, well inside their own std). The blocks the prune removed are still
+  the blocks at the bottom. So the CANDIDATES were correctly identified even
+  under the broken harness — the bug did not distort which features matter.
+
+22.2 The prune itself is a tie, and one of its stated justifications reverses
+
+  42 vs 58 features, paired across the same 36 monthly origins, both runs on the
+  fixed harness:
+
+    AUC        -0.0059   95% CI [-0.0184, +0.0066]   p = 0.355   16/36 better
+    accuracy   -0.0121   95% CI [-0.0322, +0.0079]   p = 0.235   13/36 better
+    Brier      -0.0003   95% CI [-0.0017, +0.0011]   p = 0.682   18/36 better
+
+    42 features: per-month AUC 0.5512, 28/36 above 0.5, pooled 0.5361
+    58 features: per-month AUC 0.5571, 30/36 above 0.5, pooled 0.5353
+
+  Every point estimate now favours the LARGER set, and none is significant. The
+  headline verdict is unchanged from 15.2 — dropping 28% of the inputs costs
+  nothing measurable — but it should be read as a tie rather than as a free win.
+
+  One specific claim in 15.2 does not survive: it justified the prune partly
+  because it "restored 13/18 months above 0.5 (the 58-feature set gave 11/18)".
+  On the fixed harness that ordering reverses, 30/36 against 28/36. That was
+  noise being read as a reason.
+
+22.3 Decision: the prune stands, on parsimony alone
+
+  Kept, and the reasoning is narrower than it was. 42 inputs against ~4500
+  effective training labels is a better ratio than 58, fewer inputs can drift,
+  and the dropped set includes the xmkt_corr_main_eth block flagged at -0.87 to
+  -1.66 sd of train/test shift. That is a real argument. "It scores better" is
+  not, and 15.2 should not have implied it.
+
+  Not changed in config. Anyone reversing this should note that the evidence for
+  either side is a coin flip, so it is a judgement call, not a measurement.
+
+22.4 Measurement debt: cleared
+
+  Every conclusion in sections 13-15 that was produced through the broken
+  build_span has now been re-measured or explicitly retired:
+
+    prior_shift (14.3)        retired — Brier effect changed sign (16.5)
+    label_autocorr (15)       retired — its 0.5802 baseline was lookahead (16.4)
+    trailing-prior baseline   retired — 0.5066 at the true anchor (16.4)
+    barrier geometry (5.1)    re-run, incumbent held (18)
+    feature importance (15.1) re-run, ranking reproduced (22.1)
+    the 42-feature prune (15.2) re-run, tie, kept on parsimony (22.2)
+    rolling AUC (14.2)        re-run, 0.5373 -> 0.5512 (16.3)
+
+  Nothing in the plan now rests on a number measured before 2026-09-08.
+
+================================================================================
+23. LIQUIDATION COLLECTOR (2026-09-10) — and a failure mode I built and then hit
+================================================================================
+
+The second half of 21: forced flow. A liquidation is not a trade anyone chose to
+make, it is the exchange closing a position at market, so it is mechanically
+price-moving and mechanically clustered — the most-cited short-horizon predictor
+this repo does not have.
+
+23.1 Why it is a daemon
+
+  /fapi/v1/allForceOrders is 404. The only source is the websocket stream, which
+  remembers nothing. binance_derivatives can recover from a 29-DAY outage; this
+  cannot recover from a 29-SECOND one.
+
+  Shipped as its own compose service (`liquidations`, restart: unless-stopped)
+  rather than a cron entry, with the data directory mounted read-write.
+
+23.2 ZERO IS DATA — and the first design got it wrong
+
+  A calm hour has no liquidations. A dead collector also has no liquidations.
+  If those look alike the eventual feature is "forced flow, except when the
+  process was down, where it is confidently zero". So the collector writes a
+  heartbeat on a fixed interval and coverage is computed from heartbeats, not
+  from events: heartbeat + no events = a real zero; no heartbeat = a hole.
+
+  THEN THE HEARTBEAT ITSELF TURNED OUT TO BE INSUFFICIENT, and only by accident.
+  Smoke-testing produced 0 events in 150s, which is plausible for BTCUSDT. To
+  check, the all-symbol stream was tried: 0 events in 90s, which is not plausible
+  for anything. Then `btcusdt@aggTrade`, which fires several times a second: also
+  0. Diagnosis:
+
+    wss://fstream.binance.com/...    connects, state=1, sends NOTHING, any stream
+    wss://stream.binance.com:9443/.. works fine, same machine, same second
+    https://fapi.binance.com REST    works fine (the 21.x collector uses it)
+
+  So the futures websocket accepts the connection from this network and then
+  stays silent. Nothing raises, nothing retries, the socket looks healthy.
+
+  A process heartbeat would have recorded "alive, zero liquidations" every
+  minute, forever, and every one of those hours would have entered the training
+  set as a confident zero. The file written to prevent exactly that failure
+  contained exactly that failure.
+
+  Fix: subscribe to markPrice@1s alongside forceOrder purely as a canary. The
+  exchange sends it once a second unconditionally, so a heartbeat is written only
+  while the canary is fresh. "Covered" now means the exchange was demonstrably
+  talking to us, not that this process was running.
+
+  A second, subtler version of the same bug survived the first fix: the canary
+  was seeded with the current time on connect, as a grace period, so one
+  heartbeat was written before anything had been proven — and the run duly
+  reported "1 covered hour" against a dead socket. The seed is gone; an open
+  socket is not evidence.
+
+23.3 Verification status — honest
+
+  The collector CANNOT be verified end-to-end from here, because the futures
+  websocket delivers nothing to this machine. What is verified:
+
+    * the canary correctly refuses to claim coverage against the dead socket
+      (observed: warning printed, no heartbeat file, no CSV rows);
+    * parse_event against Binance's documented payload, including the side
+      convention (forced SELL = a LONG liquidated), which is invertible without
+      changing any magnitude and so is asserted rather than eyeballed;
+    * zero-vs-missing in the aggregate, both directions.
+
+    6 offline tests, data_fetch/test_liquidations.py.
+
+  What is NOT verified: that a real forceOrder event round-trips. That needs a
+  network where fstream responds. First deploy should check `--status` shows a
+  live heartbeat within a few minutes, and events accumulating within a day.
+
+23.4 Also fixed while here
+
+  aggregate() now treats an hour containing a received event as covered even if
+  no heartbeat landed in it — receiving an event IS proof of liveness, and
+  without this an event arriving before the session's first beat was discarded.
+
+23.5 State of the data-collection bet
+
+    derivatives (REST, 30d retention)   collecting since 2026-09-09, 1.0 months
+    liquidations (websocket, no history) code ready, unverified, awaiting deploy
+    book depth                           not built — snapshots only, also a daemon
+
+  Neither is modellable for a long time; see 21.5. The point of both is that the
+  clock cannot be started retroactively.
+
+================================================================================
+24. ONE-SIDED TOUCH — the decomposition that finally beats direction (2026-09-10)
+================================================================================
+
+Section 20 established that "will EITHER barrier be touched" is strongly
+predictable (AUC 0.81) while "WHICH barrier first" is not (0.55). Those are the
+two ends of a spectrum and the middle had never been tried:
+
+    which first      direction        AUC 0.5516   exhausted
+    either touched   volatility       AUC 0.8054   strong, not directional
+    ONE side touched   ?              untested
+
+"Will the UPPER barrier be touched at all within H bars" is mostly a volatility
+question — but the ASYMMETRY between the two sides is directional, and it is a
+different estimator of direction than the which-first label.
+
+24.1 The labels
+
+  features.barrier_touch_flags() scans the whole holding window for both
+  barriers instead of stopping at the first, so an anchor can touch both, either
+  or neither. Over the full frame at 2.5 sigma / 24 bars:
+
+    upper touched 55.68%   lower touched 55.55%   both 22.29%   neither 11.06%
+
+  Consistency checked against the first-touch labels: every label=UP anchor did
+  touch the upper barrier, every label=DOWN touched the lower. Alignment checked
+  the way that has now caught three bugs — labels[bar] == y, 0 mismatches of
+  25416 on both sides, every anchor observable.
+
+24.2 Each side, 36 rolling origins
+
+    touch_upper   per-month AUC 0.6156   33/36 months > 0.5
+    touch_lower   per-month AUC 0.6441   36/36 months > 0.5
+
+24.3 THE RESULT — the asymmetry predicts direction better than the direction model
+
+  Scored against the SAME direction labels, on the same anchors, same months:
+
+    predictor                          pooled    per-month   months>0.5
+    direction model (incumbent)        0.5358      0.5516       28/36
+    p_up alone                         0.5323      0.5335       28/36
+    logit(p_up) - logit(p_down)        0.5709      0.5703       32/36
+    direction model + 0.5*asymmetry    0.5666      0.5702       31/36
+
+    asymmetry - incumbent, paired per month:
+        +0.0187   95% CI [+0.0049, +0.0326]   p = 0.0081   24/36 months better
+
+  The combination does not beat the asymmetry alone (0.5702 vs 0.5703), so the
+  asymmetry SUBSUMES the incumbent rather than complementing it. Correlation
+  between the two logits is +0.503 — related, not redundant.
+
+24.4 AND IT SURVIVES COSTS, which nothing else has
+
+  Sequential (one position at a time), 8 bp round trip, resolve-rate haircut
+  applied — the same pricing that killed every previous candidate:
+
+    coverage  trades    acc    gross/trade   net/entered      t    months+
+        2%      121   61.98%    +0.3233%      +0.2058%      2.62     6/8
+        5%      279   60.93%    +0.3060%      +0.1905%      4.04    14/18
+       10%      515   61.55%    +0.2913%      +0.1775%      5.38    24/35
+       20%      975   57.13%    +0.1752%      +0.0749%      4.51    23/36
+       50%     2167   55.33%    +0.1286%      +0.0337%      4.91    18/36
+      100%     3616   53.46%    +0.0831%      -0.0065%      4.19    16/36
+
+    incumbent for comparison:
+       10%      466   53.00%    +0.0754%      -0.0133%      1.32     9/20
+      100%     3616   50.94%    +0.0138%      -0.0678%      0.69    12/36
+
+  Net positive at every coverage up to 50%, with t = 4-5 against the incumbent's
+  0.7-1.3. Plan 17 concluded "not shown to make money"; this is the first
+  variant where that sentence would be wrong.
+
+24.5 Why this should work, stated so it can be attacked
+
+  The which-first label is conditioned on resolution and discards the 11% of
+  anchors where neither barrier is hit. Each one-sided label is a cleaner binary
+  event defined on every observable anchor, so both models train on ~11% more
+  data against a better-posed target, and the difference of two well-estimated
+  quantities beats one poorly-estimated one. That is an ordinary decomposition
+  argument, not a new signal — the information was always there, asked for badly.
+
+24.6 What would have to be true for this to be wrong
+
+  Stated plainly because the result is large and this programme has produced
+  three false positives already (14.3 prior shift, 15 label_autocorr, 18.4
+  barrier geometry), every one of which looked like this at first:
+
+    * It is one decomposition, tried once, and it worked. No sweep, so no
+      best-of-N inflation — but also no replication.
+    * The touch models were never confirmed on the frozen tail the way 20.3
+      confirmed the resolution model. That is the obvious next check.
+    * The pricing assumes take-profit and stop fills AT the barrier, which is
+      optimistic; 17.1 flagged the same assumption.
+    * t = 5.38 is computed over 515 SEQUENTIAL trades whose labels still overlap
+      somewhat; the block CI has not been computed for this signal yet.
+
+24.7 Next, in order
+
+  1. Frozen-tail confirmation (apps/resolution_backtest, both sides, one fitted
+     artifact) — the check that reproduced 20.1 and would catch a harness effect.
+  2. Block-bootstrap CI on the net-per-trade figure, as plan 17 does.
+  3. Only then: geometry sweep on the asymmetry, and a serving path.

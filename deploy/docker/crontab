@@ -13,3 +13,17 @@
 # Report staleness hourly so a broken feed is visible in the log rather than
 # silently degrading predictions.
 25 * * * * cd /app && PYTHONPATH=/app python -m technical_analysis_trainer.data_fetch.macro_fred --check >> /var/log/macro_fetch.log 2>&1
+
+# Futures positioning (open interest, long/short ratios, taker flow, basis).
+#
+# THIS ONE CANNOT BE CAUGHT UP. Binance keeps 30 days of /futures/data/* and
+# rejects any startTime older than that outright (measured 2026-09-09: -30d ok,
+# -31d -> HTTP 400). There is no archive to backfill from, so the training set
+# for the next attempt at direction (plan 11, 19.5) is only as long as this job
+# has been running. A month of downtime is a month that never exists.
+#
+# Every 6 hours rather than hourly: each run re-fetches the last 24h of overlap,
+# so four runs a day leave ~29 days of margin against a silent failure while
+# costing 24 requests. The run prints its own coverage/gap report, so the log
+# shows a lapse before it becomes permanent.
+10 */6 * * * cd /app && PYTHONPATH=/app python -m technical_analysis_trainer.data_fetch.binance_derivatives >> /var/log/derivatives_fetch.log 2>&1

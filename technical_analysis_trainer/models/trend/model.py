@@ -190,6 +190,16 @@ def train_trend_lstm(
     # accuracy out of sample (test AUC 0.5386 vs 0.5557).
     min_epochs = max(1, int(cfg.get("min_epochs", 3)))
 
+    # Hard epoch cap, independent of `epochs`.
+    #
+    # The final refit has no validation split — every held-out bar is spent on
+    # being recent training data or on calibration — so it cannot early-stop and
+    # instead trains for a budget taken from the folds' kept epochs. `epochs`
+    # still sets the cosine horizon, so the learning-rate trajectory is the one
+    # the folds actually ran; only the stopping point is imposed. Capping via
+    # `epochs` instead would compress the schedule and train a different model.
+    stop_after = int(cfg.get("stop_after_epoch") or 0)
+
     history = {"train_loss": [], "val_loss": [], "val_auc": [], "lr": []}
 
     best_val_loss = float("inf")
@@ -262,6 +272,10 @@ def train_trend_lstm(
                 f"(best {early_stopping_metric} at epoch {best_metric_epoch})"
             )
             stopped_early = True
+            break
+
+        if stop_after and (epoch + 1) >= stop_after:
+            print(f"Stopping at the fixed budget of {stop_after} epoch(s)")
             break
 
     if best_state is not None:
